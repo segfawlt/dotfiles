@@ -1,0 +1,11 @@
+{
+  "plugins": {
+    "playwright": {
+      "enabled": false
+    }
+  },
+  "userSettings": {
+    "enableNotificationsForSpecialEvents": false,
+    "themeMode": "THEME_MODE_INHERIT"
+  }
+}

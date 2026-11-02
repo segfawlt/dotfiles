@@ -1,0 +1,12 @@
+{
+  "name": "rtk",
+  "displayName": "RTK + Command Safety Gate",
+  "version": "1.0.1",
+  "description": "Transparent shell output compression via rtk (Rust Token Killer) paired with an approval gate for destructive git, filesystem, and database commands.",
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "Show git status and recent commits",
+    "Run the test suite and inspect any failures",
+    "Check rtk token savings with rtk gain"
+  ]
+}

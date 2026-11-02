@@ -1,0 +1,12 @@
+{
+  "name": "playwright",
+  "displayName": "Playwright Browser & UI Audit",
+  "version": "1.0.0",
+  "disabled": true,
+  "description": "On-demand Chromium browser automation (@playwright/mcp) paired with the two-pass /ui-flaw-scan audit playbook. Disabled by default to keep non-UI sessions fast and lean.",
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "/ui-flaw-scan",
+    "Open localhost and check console/network errors across desktop and mobile widths"
+  ]
+}

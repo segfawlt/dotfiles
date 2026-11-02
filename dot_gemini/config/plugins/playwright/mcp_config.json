@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "playwright": {
+      "command": "pnpm",
+      "args": [
+        "dlx",
+        "@playwright/mcp",
+        "--extension",
+        "--user-data-dir=/home/domixi/.config/chromium",
+        "--executable-path=/usr/sbin/chromium"
+      ]
+    }
+  }
+}

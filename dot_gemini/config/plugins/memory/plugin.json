@@ -1,0 +1,12 @@
+{
+  "name": "memory",
+  "displayName": "Shared Repo Memory",
+  "version": "1.0.0",
+  "description": "Progressive-disclosure repository memory (memory_summary.md + MEMORY.md + auto-extracted skills + FTS5 rollout search) shared across Antigravity and Pi.",
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "/memory status",
+    "/memory search apiFetch",
+    "/memory sync"
+  ]
+}

@@ -1,0 +1,12 @@
+{
+  "name": "diagnostics",
+  "displayName": "Instant Post-Edit Diagnostics",
+  "version": "1.0.0",
+  "description": "Sub-50ms post-edit syntax & parse diagnostics for Python, TypeScript/TSX/JS, JSON/JSONC, JSONL, TOML, YAML, Bash/Sh, Fish, and Go via transient zero-bloat ephemeral injection.",
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "/diagnostics status",
+    "/diagnostics logs",
+    "/diagnostics off"
+  ]
+}

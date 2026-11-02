@@ -1,0 +1,19 @@
+{
+  "repo-memory": {
+    "enabled": true,
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "~/.local/bin/agent-memory session-start-hook",
+        "timeout": 10
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "~/.local/bin/agent-memory stop-hook",
+        "timeout": 10
+      }
+    ]
+  }
+}

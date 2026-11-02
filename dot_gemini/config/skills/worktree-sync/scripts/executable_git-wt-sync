@@ -1,0 +1,1205 @@
+#!/usr/bin/env bash
+# git-wt-sync: Audit, conflict-check, and clean up parallel Git worktrees.
+# Detects uncommitted work, fork-point mismatches, textual conflicts (including dirty files),
+# cross-worktree semantic file overlaps ("ghost conflicts"), lockfiles, cascade conflicts,
+# broken states, and misplaced target branches.
+#
+# Invariant: 100% read-only in audit mode (ZERO loose objects written to .git/objects).
+
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: git wt-sync [options] [target-branch]
+
+Audit all worktrees in the current repository against a target branch (default: main/master).
+Checks uncommitted changes, fork-point history mismatches, textual merge conflicts
+(including uncommitted work), cross-worktree file overlaps ("ghost conflicts"),
+in-progress operations, squash-merged branches, and misplaced branches.
+
+Options:
+  --prune-merged   Automatically remove secondary worktrees (and their local branches)
+                   that are clean and have 0 net diff or 0 commits ahead of target-branch.
+                   Skips locked worktrees safely.
+  --no-color       Disable colored output.
+  -h, --help       Show this help message.
+EOF
+}
+
+PRUNE_MERGED=false
+USE_COLOR=true
+TARGET_BRANCH=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --prune-merged)
+      PRUNE_MERGED=true
+      shift
+      ;;
+    --no-color)
+      USE_COLOR=false
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    -*)
+      echo "Unknown option: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+    *)
+      TARGET_BRANCH="$1"
+      shift
+      ;;
+  esac
+done
+
+if [[ "$USE_COLOR" == true && -t 1 ]]; then
+  C_RESET=$'\033[0m'
+  C_BOLD=$'\033[1m'
+  C_DIM=$'\033[2m'
+  C_RED=$'\033[31m'
+  C_GREEN=$'\033[32m'
+  C_YELLOW=$'\033[33m'
+  C_BLUE=$'\033[34m'
+  C_MAGENTA=$'\033[35m'
+  C_CYAN=$'\033[36m'
+else
+  C_RESET=""
+  C_BOLD=""
+  C_DIM=""
+  C_RED=""
+  C_GREEN=""
+  C_YELLOW=""
+  C_BLUE=""
+  C_MAGENTA=""
+  C_CYAN=""
+fi
+
+# Ensure inside a Git repository
+if ! git rev-parse --git-dir >/dev/null 2>&1; then
+  echo "${C_RED}Error:${C_RESET} Not inside a Git repository." >&2
+  exit 1
+fi
+
+# Temporary directory for index snapshots, simulated objects, and overlap tracking
+TMP_DIR=$(mktemp -d)
+trap 'rm -rf "$TMP_DIR"' EXIT
+
+# Isolate simulated index/tree/commit objects into $TMP_DIR/objects
+# so ZERO loose objects are written to the real repository .git/objects
+REAL_COMMON_DIR=$(cd "$(git rev-parse --git-common-dir)" && pwd)
+REAL_OBJ_DIR="$REAL_COMMON_DIR/objects"
+SIM_OBJ_DIR="$TMP_DIR/objects"
+mkdir -p "$SIM_OBJ_DIR/info" "$SIM_OBJ_DIR/pack"
+echo "$REAL_OBJ_DIR" > "$SIM_OBJ_DIR/info/alternates"
+if [[ -f "$REAL_OBJ_DIR/info/alternates" ]]; then
+  cat "$REAL_OBJ_DIR/info/alternates" >> "$SIM_OBJ_DIR/info/alternates"
+fi
+
+# Parse worktrees via porcelain format
+declare -a WT_PATHS=()
+declare -a WT_BRANCHES=()
+declare -a WT_HEADS=()
+declare -a WT_IS_PRIMARY=()
+declare -a WT_LOCKED=()
+declare -a WT_LOCK_REASONS=()
+declare -a WT_PRUNABLE=()
+declare -a WT_PRUNE_REASONS=()
+declare -a WT_MISSING_DIR=()
+
+current_wt=""
+current_head=""
+current_branch=""
+current_locked=false
+current_locked_reason=""
+current_prunable=false
+current_prunable_reason=""
+current_idx=0
+
+while IFS= read -r line || [[ -n "$line" ]]; do
+  if [[ -z "$line" ]]; then
+    if [[ -n "$current_wt" ]]; then
+      WT_PATHS+=("$current_wt")
+      WT_HEADS+=("$current_head")
+      WT_BRANCHES+=("${current_branch:-(detached)}")
+      if [[ $current_idx -eq 0 ]]; then
+        WT_IS_PRIMARY+=("true")
+      else
+        WT_IS_PRIMARY+=("false")
+      fi
+      WT_LOCKED+=("$current_locked")
+      WT_LOCK_REASONS+=("$current_locked_reason")
+      WT_PRUNABLE+=("$current_prunable")
+      WT_PRUNE_REASONS+=("$current_prunable_reason")
+      if [[ ! -d "$current_wt" ]]; then
+        WT_MISSING_DIR+=("true")
+      else
+        WT_MISSING_DIR+=("false")
+      fi
+
+      current_idx=$((current_idx + 1))
+      current_wt=""
+      current_head=""
+      current_branch=""
+      current_locked=false
+      current_locked_reason=""
+      current_prunable=false
+      current_prunable_reason=""
+    fi
+    continue
+  fi
+
+  case "$line" in
+    worktree\ *)
+      current_wt="${line#worktree }"
+      ;;
+    HEAD\ *)
+      current_head="${line#HEAD }"
+      ;;
+    branch\ *)
+      current_branch="${line#branch refs/heads/}"
+      ;;
+    detached)
+      current_branch="(detached)"
+      ;;
+    locked*)
+      current_locked=true
+      if [[ "$line" =~ ^locked[[:space:]]+(.*)$ ]]; then
+        current_locked_reason="${BASH_REMATCH[1]}"
+      else
+        current_locked_reason="locked"
+      fi
+      ;;
+    prunable*)
+      current_prunable=true
+      if [[ "$line" =~ ^prunable[[:space:]]+(.*)$ ]]; then
+        current_prunable_reason="${BASH_REMATCH[1]}"
+      else
+        current_prunable_reason="prunable"
+      fi
+      ;;
+  esac
+done < <(git worktree list --porcelain; echo "")
+
+TOTAL_WT=${#WT_PATHS[@]}
+
+# Helper to format unique worktree label (handles multiple detached HEADs)
+format_wt_label() {
+  local k="$1"
+  local b="${WT_BRANCHES[$k]}"
+  local h="${WT_HEADS[$k]}"
+  local p="${WT_PATHS[$k]}"
+  if [[ "$b" != "(detached)" ]]; then
+    echo "$b"
+  else
+    local hshort
+    hshort=$(git rev-parse --short "$h" 2>/dev/null || echo "???")
+    local bname
+    bname=$(basename "$p")
+    echo "detached@${hshort}(${bname})"
+  fi
+}
+
+# Determine target branch if not specified
+if [[ -z "$TARGET_BRANCH" ]]; then
+  if git show-ref --verify --quiet refs/heads/main; then
+    TARGET_BRANCH="main"
+  elif git show-ref --verify --quiet refs/heads/master; then
+    TARGET_BRANCH="master"
+  else
+    origin_sym=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null || true)
+    origin_name="${origin_sym#refs/remotes/origin/}"
+    if [[ -n "$origin_name" ]] && git show-ref --verify --quiet "refs/heads/$origin_name"; then
+      TARGET_BRANCH="$origin_name"
+    elif [[ $TOTAL_WT -gt 0 && "${WT_BRANCHES[0]}" != "(detached)" ]]; then
+      TARGET_BRANCH="${WT_BRANCHES[0]}"
+    else
+      echo "${C_RED}Error:${C_RESET} Could not auto-detect target branch (main/master). Please pass it explicitly." >&2
+      exit 1
+    fi
+  fi
+fi
+
+if ! TARGET_SHA=$(git rev-parse --verify "$TARGET_BRANCH" 2>/dev/null); then
+  echo "${C_RED}Error:${C_RESET} Target branch '$TARGET_BRANCH' does not exist." >&2
+  exit 1
+fi
+TARGET_TREE=$(git rev-parse "$TARGET_SHA^{tree}")
+TARGET_SHORT=$(git rev-parse --short "$TARGET_SHA")
+TARGET_SUBJECT=$(git log -1 --format="%s (%cr)" "$TARGET_SHA")
+
+# Detect where target branch is checked out
+TARGET_WT_IDX=-1
+for ((i = 0; i < TOTAL_WT; i++)); do
+  if [[ "${WT_BRANCHES[$i]}" == "$TARGET_BRANCH" ]]; then
+    TARGET_WT_IDX=$i
+    break
+  fi
+done
+
+# Detect nested worktrees and whether they are gitignored
+declare -a WT_NESTED_WARNINGS=()
+declare -a WT_NESTED_EXCLUDES=()
+for ((i = 0; i < TOTAL_WT; i++)); do
+  wt_p="${WT_PATHS[$i]}"
+  warns=""
+  excl=""
+  if [[ "${WT_MISSING_DIR[$i]}" == "false" ]]; then
+    for ((k = 0; k < TOTAL_WT; k++)); do
+      [[ $k -eq $i ]] && continue
+      other_p="${WT_PATHS[$k]}"
+      if [[ "$other_p" == "${wt_p}/"* ]]; then
+        rel="${other_p#"${wt_p}/"}"
+        if ! git -C "$wt_p" check-ignore -q "$rel" 2>/dev/null; then
+          warns+="🚨 NESTED WORKTREE NOT GITIGNORED: ${rel} (in ${other_p})"$'\n'
+        fi
+        excl+="${rel}"$'\n'
+      fi
+    done
+  fi
+  WT_NESTED_WARNINGS+=("$warns")
+  WT_NESTED_EXCLUDES+=("$excl")
+done
+
+# First pass: analyze status, git operations, dirty files, sim_commits
+declare -a WT_ACTIVE_OPS=()
+declare -a WT_DIRTY_COUNTS=()
+declare -a WT_STAGED_COUNTS=()
+declare -a WT_UNSTAGED_COUNTS=()
+declare -a WT_UNTRACKED_COUNTS=()
+declare -a WT_UNMERGED_COUNTS=()
+declare -a WT_SUSPICIOUS_UNTRACKED=()
+declare -a WT_SIM_COMMITS=()
+declare -a WT_FORK_SHAS=()
+declare -a WT_AHEAD_COUNTS=()
+declare -a WT_BEHIND_COUNTS=()
+declare -a WT_CONFLICT_MARKERS=()
+declare -A FORK_COUNTS=()
+declare -A FILE_TOUCH_MAP=()
+
+for ((i = 0; i < TOTAL_WT; i++)); do
+  wt_path="${WT_PATHS[$i]}"
+  wt_head="${WT_HEADS[$i]}"
+  wt_branch="${WT_BRANCHES[$i]}"
+  is_missing="${WT_MISSING_DIR[$i]}"
+  nested_excl="${WT_NESTED_EXCLUDES[$i]}"
+
+  active_op=""
+  dirty_count=0
+  staged_count=0
+  unstaged_count=0
+  untracked_count=0
+  unmerged_count=0
+  suspicious_str=""
+  has_conflict_markers=false
+
+  if [[ "$is_missing" == "true" ]]; then
+    active_op="MISSING DIRECTORY"
+    sim_commit="$wt_head"
+  else
+    # Check in-progress git operations
+    rebase_merge=$(git -C "$wt_path" rev-parse --path-format=absolute --git-path rebase-merge 2>/dev/null || true)
+    rebase_apply=$(git -C "$wt_path" rev-parse --path-format=absolute --git-path rebase-apply 2>/dev/null || true)
+    merge_head=$(git -C "$wt_path" rev-parse --path-format=absolute --git-path MERGE_HEAD 2>/dev/null || true)
+    cp_head=$(git -C "$wt_path" rev-parse --path-format=absolute --git-path CHERRY_PICK_HEAD 2>/dev/null || true)
+    rev_head=$(git -C "$wt_path" rev-parse --path-format=absolute --git-path REVERT_HEAD 2>/dev/null || true)
+    bisect_log=$(git -C "$wt_path" rev-parse --path-format=absolute --git-path BISECT_LOG 2>/dev/null || true)
+    idx_lock=$(git -C "$wt_path" rev-parse --path-format=absolute --git-path index.lock 2>/dev/null || true)
+
+    if [[ -d "$rebase_merge" || -d "$rebase_apply" ]]; then
+      rdir="$rebase_merge"
+      [[ ! -d "$rdir" ]] && rdir="$rebase_apply"
+      orig_b=""
+      if [[ -f "$rdir/head-name" ]]; then
+        orig_b=$(cat "$rdir/head-name" 2>/dev/null | sed 's|^refs/heads/||')
+      fi
+      if [[ -n "$orig_b" ]]; then
+        active_op="🚨 IN-PROGRESS REBASE (rebasing '${orig_b}')"
+      else
+        active_op="🚨 IN-PROGRESS REBASE"
+      fi
+    elif [[ -f "$merge_head" ]]; then
+      active_op="🚨 IN-PROGRESS MERGE"
+    elif [[ -f "$cp_head" ]]; then
+      active_op="🚨 IN-PROGRESS CHERRY-PICK"
+    elif [[ -f "$rev_head" ]]; then
+      active_op="🚨 IN-PROGRESS REVERT"
+    elif [[ -f "$bisect_log" ]]; then
+      active_op="⚠️ IN-PROGRESS BISECT"
+    fi
+
+    if [[ -f "$idx_lock" ]]; then
+      if [[ -n "$active_op" ]]; then
+        active_op="${active_op}, 🔒 INDEX LOCKED"
+      else
+        active_op="🔒 INDEX LOCKED (index.lock exists)"
+      fi
+    fi
+
+    # Build exclude pathspecs for nested worktrees
+    declare -a status_excludes=()
+    while IFS= read -r n; do
+      [[ -z "$n" ]] && continue
+      status_excludes+=(":(exclude)$n" ":(exclude)$n/**")
+    done <<< "$nested_excl"
+
+    # Parse status --porcelain=v1 -uall
+    status_out=$(git -C "$wt_path" status --porcelain=v1 -uall -- . "${status_excludes[@]}" 2>/dev/null || true)
+    declare -a untracked_files=()
+
+    if [[ -n "$status_out" ]]; then
+      while IFS= read -r sline; do
+        [[ -z "$sline" ]] && continue
+        x_char="${sline:0:1}"
+        y_char="${sline:1:1}"
+        f_path="${sline:3}"
+        # Strip quotes if git quoted the path
+        if [[ "$f_path" =~ ^\"(.*)\"$ ]]; then
+          f_path="${BASH_REMATCH[1]}"
+        fi
+
+        # Check unmerged / conflict states
+        if [[ "$x_char" == "U" || "$y_char" == "U" || "$sline" =~ ^(DD|AU|UD|UA|DU|AA|UU) ]]; then
+          unmerged_count=$((unmerged_count + 1))
+        elif [[ "$x_char" == "?" && "$y_char" == "?" ]]; then
+          untracked_count=$((untracked_count + 1))
+          untracked_files+=("$f_path")
+        else
+          if [[ "$x_char" != " " && "$x_char" != "?" && "$x_char" != "!" ]]; then
+            staged_count=$((staged_count + 1))
+          fi
+          if [[ "$y_char" != " " && "$y_char" != "?" && "$y_char" != "!" ]]; then
+            unstaged_count=$((unstaged_count + 1))
+          fi
+        fi
+      done <<< "$status_out"
+    fi
+    dirty_count=$((unmerged_count + staged_count + unstaged_count + untracked_count))
+
+    # Triage untracked files for suspicious files / junk / secrets
+    susp_list=()
+    for uf in "${untracked_files[@]}"; do
+      ubase=$(basename "$uf")
+      # Match secrets and junk patterns
+      if [[ "$ubase" =~ ^\.env(\..+)?$ && "$ubase" != ".env.example" && "$ubase" != ".env.sample" ]]; then
+        susp_list+=("$uf")
+      elif [[ "$ubase" =~ \.log$ || "$ubase" == ".DS_Store" || "$ubase" =~ \.(tmp|swp)$ ]]; then
+        susp_list+=("$uf")
+      elif [[ "$uf" =~ (^|/)(node_modules|\.venv|venv|__pycache__|dist|build|coverage)(/|$) ]]; then
+        susp_list+=("$uf")
+      fi
+    done
+    if [[ ${#susp_list[@]} -gt 0 ]]; then
+      suspicious_str=$(printf "%s, " "${susp_list[@]}")
+      suspicious_str="${suspicious_str%, }"
+    fi
+
+    # Create ephemeral sim_commit if worktree is dirty
+    # If unmerged > 0 or active conflicted op, DO NOT stage conflict markers
+    if [[ "$unmerged_count" -gt 0 || "$active_op" == *"IN-PROGRESS"* ]]; then
+      sim_commit="$wt_head"
+    elif [[ "$dirty_count" -gt 0 ]]; then
+      tmp_idx="$TMP_DIR/index_$i"
+      real_idx=$(git -C "$wt_path" rev-parse --path-format=absolute --git-path index 2>/dev/null || true)
+      if [[ -f "$real_idx" ]]; then
+        cp "$real_idx" "$tmp_idx" 2>/dev/null || true
+      fi
+
+      # Exclude files > 20MB from ephemeral staging to prevent memory spikes
+      declare -a size_excludes=()
+      for uf in "${untracked_files[@]}"; do
+        full_uf="${wt_path}/${uf}"
+        if [[ -f "$full_uf" ]]; then
+          fsize=$(wc -c < "$full_uf" 2>/dev/null || echo "0")
+          if [[ "$fsize" -gt 20971520 ]]; then
+            size_excludes+=(":(exclude)$uf" ":(exclude)$uf/**")
+          fi
+        fi
+      done
+
+      if [[ "$untracked_count" -gt 1000 ]]; then
+        GIT_INDEX_FILE="$tmp_idx" GIT_OBJECT_DIRECTORY="$SIM_OBJ_DIR" git -C "$wt_path" add -u -- . 2>/dev/null || true
+      else
+        GIT_INDEX_FILE="$tmp_idx" GIT_OBJECT_DIRECTORY="$SIM_OBJ_DIR" git -C "$wt_path" add -A -- . "${status_excludes[@]}" "${size_excludes[@]}" 2>/dev/null || true
+      fi
+
+      tree_sha=$(GIT_INDEX_FILE="$tmp_idx" GIT_OBJECT_DIRECTORY="$SIM_OBJ_DIR" git -C "$wt_path" write-tree 2>/dev/null || true)
+      if [[ -n "$tree_sha" ]]; then
+        sim_commit=$(GIT_OBJECT_DIRECTORY="$SIM_OBJ_DIR" git -C "$wt_path" commit-tree "$tree_sha" -p "$wt_head" -m "WIP snapshot for wt-sync" 2>/dev/null || echo "$wt_head")
+      else
+        sim_commit="$wt_head"
+      fi
+    else
+      sim_commit="$wt_head"
+    fi
+  fi
+
+  WT_ACTIVE_OPS+=("$active_op")
+  WT_DIRTY_COUNTS+=("$dirty_count")
+  WT_STAGED_COUNTS+=("$staged_count")
+  WT_UNSTAGED_COUNTS+=("$unstaged_count")
+  WT_UNTRACKED_COUNTS+=("$untracked_count")
+  WT_UNMERGED_COUNTS+=("$unmerged_count")
+  WT_SUSPICIOUS_UNTRACKED+=("$suspicious_str")
+  WT_SIM_COMMITS+=("$sim_commit")
+
+  # Fork point with TARGET_SHA
+  fork_sha=$(git merge-base "$TARGET_SHA" "$wt_head" 2>/dev/null || true)
+  WT_FORK_SHAS+=("$fork_sha")
+
+  if [[ -n "$fork_sha" ]]; then
+    ahead_count=$(git rev-list --count "$TARGET_SHA..$wt_head" 2>/dev/null || echo "0")
+    behind_count=$(git rev-list --count "$wt_head..$TARGET_SHA" 2>/dev/null || echo "0")
+
+    # Track cohort majority fork point
+    if [[ "${WT_IS_PRIMARY[$i]}" == "false" && ("$ahead_count" -gt 0 || "$dirty_count" -gt 0) ]]; then
+      FORK_COUNTS["$fork_sha"]=$(( ${FORK_COUNTS["$fork_sha"]:-0} + 1 ))
+    fi
+
+    # Check for leftover conflict markers
+    if [[ "$is_missing" == "false" && "$fork_sha" != "$sim_commit" ]]; then
+      markers=$(GIT_OBJECT_DIRECTORY="$SIM_OBJ_DIR" git -C "$wt_path" diff --check "$fork_sha" "$sim_commit" 2>/dev/null | grep -i "conflict marker" || true)
+      if [[ -n "$markers" ]]; then
+        has_conflict_markers=true
+      fi
+    fi
+  else
+    ahead_count="?"
+    behind_count="?"
+  fi
+
+  WT_AHEAD_COUNTS+=("$ahead_count")
+  WT_BEHIND_COUNTS+=("$behind_count")
+  WT_CONFLICT_MARKERS+=("$has_conflict_markers")
+done
+
+# Define TARGET_SIM_COMMIT and record uncommitted dirty files on TARGET_BRANCH
+if [[ $TARGET_WT_IDX -ge 0 ]]; then
+  TARGET_SIM_COMMIT="${WT_SIM_COMMITS[$TARGET_WT_IDX]}"
+else
+  TARGET_SIM_COMMIT="$TARGET_SHA"
+fi
+
+declare -A TARGET_DIRTY_FILES_SET=()
+if [[ "$TARGET_SIM_COMMIT" != "$TARGET_SHA" ]]; then
+  while IFS= read -r df; do
+    [[ -z "$df" ]] && continue
+    TARGET_DIRTY_FILES_SET["$df"]=1
+    existing="${FILE_TOUCH_MAP["$df"]:-}"
+    if [[ -z "$existing" ]]; then
+      FILE_TOUCH_MAP["$df"]="${TARGET_BRANCH}(uncommitted)"
+    else
+      FILE_TOUCH_MAP["$df"]="${existing}, ${TARGET_BRANCH}(uncommitted)"
+    fi
+  done < <(GIT_OBJECT_DIRECTORY="$SIM_OBJ_DIR" git diff --name-only "$TARGET_SHA" "$TARGET_SIM_COMMIT" 2>/dev/null || true)
+fi
+
+# Populate FILE_TOUCH_MAP for secondary worktrees (relative to their fork_sha)
+for ((i = 0; i < TOTAL_WT; i++)); do
+  [[ $i -eq $TARGET_WT_IDX ]] && continue
+  fork_sha="${WT_FORK_SHAS[$i]}"
+  sim_commit="${WT_SIM_COMMITS[$i]}"
+  ahead_count="${WT_AHEAD_COUNTS[$i]}"
+  dirty_count="${WT_DIRTY_COUNTS[$i]}"
+  [[ -z "$fork_sha" ]] && continue
+
+  if [[ "$ahead_count" -gt 0 || "$dirty_count" -gt 0 ]]; then
+    wt_label=$(format_wt_label "$i")
+    while IFS= read -r tf; do
+      [[ -z "$tf" ]] && continue
+      existing="${FILE_TOUCH_MAP["$tf"]:-}"
+      if [[ -z "$existing" ]]; then
+        FILE_TOUCH_MAP["$tf"]="$wt_label"
+      else
+        FILE_TOUCH_MAP["$tf"]="${existing}, ${wt_label}"
+      fi
+    done < <(GIT_OBJECT_DIRECTORY="$SIM_OBJ_DIR" git diff --name-only "$fork_sha" "$sim_commit" 2>/dev/null || true)
+  fi
+done
+
+# Find majority fork point among active secondary worktrees
+MAJORITY_FORK=""
+max_fork_count=0
+for f_sha in "${!FORK_COUNTS[@]}"; do
+  cnt="${FORK_COUNTS[$f_sha]}"
+  if [[ "$cnt" -gt "$max_fork_count" ]]; then
+    max_fork_count="$cnt"
+    MAJORITY_FORK="$f_sha"
+  fi
+done
+
+# Helper: test if file is a known lockfile
+is_lockfile() {
+  local fname
+  fname=$(basename "$1")
+  case "$fname" in
+    package-lock.json|pnpm-lock.yaml|yarn.lock|bun.lock|bun.lockb|Cargo.lock|uv.lock|poetry.lock|Gemfile.lock|composer.lock|go.sum)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+# Squash-merge / 0-net-diff detection & prune candidates
+declare -a WT_SQUASH_MERGED=()
+declare -a PRUNE_CANDIDATES=() # format: "wt_path\twt_branch\tmode(clean|squash)\tis_locked\tlock_reason"
+
+for ((i = 0; i < TOTAL_WT; i++)); do
+  is_squash=false
+  wt_path="${WT_PATHS[$i]}"
+  wt_branch="${WT_BRANCHES[$i]}"
+  dirty_count="${WT_DIRTY_COUNTS[$i]}"
+  ahead_count="${WT_AHEAD_COUNTS[$i]}"
+  active_op="${WT_ACTIVE_OPS[$i]}"
+  fork_sha="${WT_FORK_SHAS[$i]}"
+  sim_commit="${WT_SIM_COMMITS[$i]}"
+  is_primary="${WT_IS_PRIMARY[$i]}"
+  is_locked="${WT_LOCKED[$i]}"
+  lock_reason="${WT_LOCK_REASONS[$i]}"
+
+  if [[ "$i" -ne "$TARGET_WT_IDX" && "$is_primary" == "false" ]]; then
+    if [[ "$dirty_count" -eq 0 && "$ahead_count" -eq 0 && "$active_op" == "" ]]; then
+      PRUNE_CANDIDATES+=("${wt_path}"$'\t'"${wt_branch}"$'\t'"clean"$'\t'"${is_locked}"$'\t'"${lock_reason}")
+    elif [[ "$dirty_count" -eq 0 && "$active_op" == "" && "$ahead_count" != "?" && "$ahead_count" -gt 0 && -n "$fork_sha" ]]; then
+      # Run merge-tree against TARGET_SHA
+      m_out=$(GIT_OBJECT_DIRECTORY="$SIM_OBJ_DIR" git merge-tree --write-tree "$TARGET_SHA" "$sim_commit" 2>&1) || true
+      res_tree=$(printf "%s\n" "$m_out" | head -n 1)
+      if [[ "$res_tree" == "$TARGET_TREE" ]]; then
+        is_squash=true
+        PRUNE_CANDIDATES+=("${wt_path}"$'\t'"${wt_branch}"$'\t'"squash"$'\t'"${is_locked}"$'\t'"${lock_reason}")
+      fi
+    fi
+  fi
+  WT_SQUASH_MERGED+=("$is_squash")
+done
+
+# Cascade Merge Simulation:
+# Collect clean secondary worktrees, partition into non-overlapping and semantic-overlapping,
+# then merge sequentially onto virtual_tip=$TARGET_SIM_COMMIT in SIM_OBJ_DIR
+declare -a CLEAN_NON_OVERLAP_IDXS=()
+declare -a CLEAN_OVERLAP_IDXS=()
+declare -a WT_MERGE_OUTCOMES=() # "CLEAN" | "BLOCKED_DIRTY_TARGET" | "CONFLICT" | "SQUASH" | "ALREADY_MERGED" | "UNRELATED"
+declare -a WT_CONFLICT_FILES=()
+declare -a WT_OVERLAP_FILES=()
+declare -a WT_PEER_CONFLICTS=()
+declare -a WT_CASCADE_CONFLICT=()
+declare -a WT_CASCADE_WITH=()
+
+for ((i = 0; i < TOTAL_WT; i++)); do
+  WT_CASCADE_CONFLICT+=("false")
+  WT_CASCADE_WITH+=("")
+  wt_branch="${WT_BRANCHES[$i]}"
+  wt_path="${WT_PATHS[$i]}"
+  fork_sha="${WT_FORK_SHAS[$i]}"
+  sim_commit="${WT_SIM_COMMITS[$i]}"
+  dirty_count="${WT_DIRTY_COUNTS[$i]}"
+  ahead_count="${WT_AHEAD_COUNTS[$i]}"
+  is_squash="${WT_SQUASH_MERGED[$i]}"
+
+  if [[ "$i" -eq "$TARGET_WT_IDX" ]]; then
+    WT_MERGE_OUTCOMES+=("TARGET")
+    WT_CONFLICT_FILES+=("")
+    WT_OVERLAP_FILES+=("")
+    WT_PEER_CONFLICTS+=("")
+    continue
+  fi
+
+  if [[ "${WT_UNMERGED_COUNTS[$i]}" -gt 0 || "${WT_ACTIVE_OPS[$i]}" == *"IN-PROGRESS"* ]]; then
+    WT_MERGE_OUTCOMES+=("BROKEN_OP")
+    WT_CONFLICT_FILES+=("")
+    WT_OVERLAP_FILES+=("")
+    WT_PEER_CONFLICTS+=("")
+    continue
+  fi
+
+  if [[ "$dirty_count" -eq 0 && "$ahead_count" -eq 0 ]]; then
+    WT_MERGE_OUTCOMES+=("ALREADY_MERGED")
+    WT_CONFLICT_FILES+=("")
+    WT_OVERLAP_FILES+=("")
+    WT_PEER_CONFLICTS+=("")
+    continue
+  fi
+
+  if [[ "$is_squash" == "true" ]]; then
+    WT_MERGE_OUTCOMES+=("SQUASH")
+    WT_CONFLICT_FILES+=("")
+    WT_OVERLAP_FILES+=("")
+    WT_PEER_CONFLICTS+=("")
+    continue
+  fi
+
+  if [[ -z "$fork_sha" ]]; then
+    WT_MERGE_OUTCOMES+=("UNRELATED")
+    WT_CONFLICT_FILES+=("")
+    WT_OVERLAP_FILES+=("")
+    WT_PEER_CONFLICTS+=("")
+    continue
+  fi
+
+  # Secondary worktree with work: test dry-run 3-way merge against TARGET_SHA
+  m_out=""
+  m_rc=0
+  m_out=$(GIT_OBJECT_DIRECTORY="$SIM_OBJ_DIR" git merge-tree --write-tree "$TARGET_SHA" "$sim_commit" 2>&1) || m_rc=$?
+
+  # Check semantic overlaps and peer conflicts
+  overlap_arr=()
+  peer_conflicts_arr=()
+  declare -A checked_peers=()
+  collides_dirty_target=false
+  declare -a collides_dirty_target_files=()
+
+  while IFS= read -r tf; do
+    [[ -z "$tf" ]] && continue
+    touchers="${FILE_TOUCH_MAP["$tf"]:-}"
+    target_touched=false
+    if [[ "$fork_sha" != "$TARGET_SHA" ]]; then
+      if GIT_OBJECT_DIRECTORY="$SIM_OBJ_DIR" git diff --name-only "$fork_sha" "$TARGET_SHA" 2>/dev/null | grep -Fxq "$tf"; then
+        target_touched=true
+      fi
+    fi
+
+    if [[ -n "${TARGET_DIRTY_FILES_SET["$tf"]:-}" ]]; then
+      collides_dirty_target=true
+      collides_dirty_target_files+=("$tf")
+    fi
+
+    if [[ "$touchers" == *", "* ]] || [[ "$target_touched" == true ]]; then
+      if [[ "$target_touched" == true && "$touchers" != *"$TARGET_BRANCH"* ]]; then
+        overlap_arr+=("${tf} (also touched by: ${touchers}, ${TARGET_BRANCH})")
+      else
+        overlap_arr+=("${tf} (touched by: ${touchers})")
+      fi
+
+      # Check textual conflict against peer worktrees touching this file
+      for ((j = 0; j < TOTAL_WT; j++)); do
+        [[ $j -eq $i || $j -eq $TARGET_WT_IDX ]] && continue
+        peer_label=$(format_wt_label "$j")
+        if [[ ", $touchers," == *", $peer_label,"* ]] && [[ -z "${checked_peers[$j]:-}" ]]; then
+          checked_peers[$j]=1
+          peer_sim="${WT_SIM_COMMITS[$j]}"
+          if ! GIT_OBJECT_DIRECTORY="$SIM_OBJ_DIR" git merge-tree --write-tree "$sim_commit" "$peer_sim" >/dev/null 2>&1; then
+            peer_conflicts_arr+=("${peer_label} (in ${WT_PATHS[$j]})")
+          fi
+        fi
+      done
+    fi
+  done < <(GIT_OBJECT_DIRECTORY="$SIM_OBJ_DIR" git diff --name-only "$fork_sha" "$sim_commit" 2>/dev/null || true)
+  unset checked_peers
+
+  overlap_joined=$(printf "%s\n" "${overlap_arr[@]}")
+  WT_OVERLAP_FILES+=("$overlap_joined")
+  peer_joined=$(printf "%s, " "${peer_conflicts_arr[@]}")
+  WT_PEER_CONFLICTS+=("${peer_joined%, }")
+
+  # Merge outcome evaluation
+  if [[ $m_rc -eq 0 ]]; then
+    if [[ "$collides_dirty_target" == true ]]; then
+      # Test merge against TARGET_SIM_COMMIT (dirty main)
+      m_dirty_out=""
+      m_dirty_rc=0
+      m_dirty_out=$(GIT_OBJECT_DIRECTORY="$SIM_OBJ_DIR" git merge-tree --write-tree "$TARGET_SIM_COMMIT" "$sim_commit" 2>&1) || m_dirty_rc=$?
+      if [[ $m_dirty_rc -eq 0 ]]; then
+        WT_MERGE_OUTCOMES+=("BLOCKED_DIRTY_TARGET_CLEAN")
+        WT_CONFLICT_FILES+=("${collides_dirty_target_files[*]}")
+      else
+        WT_MERGE_OUTCOMES+=("CONFLICT_DIRTY_TARGET")
+        cfiles=$(printf "%s\n" "$m_dirty_out" | awk -F'\t' 'NR>1 && /^$/ {exit} NR>1 && NF>=2 {print $2}' | sort -u)
+        [[ -z "$cfiles" ]] && cfiles=$(printf "%s\n" "$m_dirty_out" | awk '/^CONFLICT / {sub(/.* in /, ""); sub(/.*: /, ""); print}' | sort -u)
+        WT_CONFLICT_FILES+=("$cfiles")
+      fi
+    else
+      WT_MERGE_OUTCOMES+=("CLEAN")
+      WT_CONFLICT_FILES+=("")
+      if [[ ${#overlap_arr[@]} -eq 0 ]]; then
+        CLEAN_NON_OVERLAP_IDXS+=("$i")
+      else
+        CLEAN_OVERLAP_IDXS+=("$i")
+      fi
+    fi
+  else
+    WT_MERGE_OUTCOMES+=("CONFLICT")
+    cfiles=$(printf "%s\n" "$m_out" | awk -F'\t' 'NR>1 && /^$/ {exit} NR>1 && NF>=2 {print $2}' | sort -u)
+    [[ -z "$cfiles" ]] && cfiles=$(printf "%s\n" "$m_out" | awk '/^CONFLICT / {sub(/.* in /, ""); sub(/.*: /, ""); print}' | sort -u)
+    WT_CONFLICT_FILES+=("$cfiles")
+  fi
+done
+
+# Run sequential cascade merge simulation on all clean candidates
+virtual_tip="$TARGET_SIM_COMMIT"
+cascade_order=("${CLEAN_NON_OVERLAP_IDXS[@]}" "${CLEAN_OVERLAP_IDXS[@]}")
+last_merged_label="${TARGET_BRANCH}"
+
+for k in "${cascade_order[@]}"; do
+  k_sim="${WT_SIM_COMMITS[$k]}"
+  k_label=$(format_wt_label "$k")
+  c_out=""
+  c_rc=0
+  c_out=$(GIT_OBJECT_DIRECTORY="$SIM_OBJ_DIR" git merge-tree --write-tree "$virtual_tip" "$k_sim" 2>&1) || c_rc=$?
+
+  if [[ $c_rc -ne 0 ]]; then
+    WT_CASCADE_CONFLICT[$k]="true"
+    WT_CASCADE_WITH[$k]="$last_merged_label"
+  else
+    v_tree=$(printf "%s\n" "$c_out" | head -n 1)
+    virtual_tip=$(GIT_OBJECT_DIRECTORY="$SIM_OBJ_DIR" git commit-tree "$v_tree" -p "$virtual_tip" -p "$k_sim" -m "Virtual merge ${k_label}" 2>/dev/null || echo "$virtual_tip")
+    last_merged_label="$k_label"
+  fi
+done
+
+# Check stashes
+stash_count=$(git stash list 2>/dev/null | wc -l | tr -d ' ')
+
+# Check unmerged local branches with no active worktree
+declare -a ORPHAN_UNMERGED_BRANCHES=()
+while IFS= read -r bname; do
+  [[ -z "$bname" || "$bname" == "$TARGET_BRANCH" ]] && continue
+  checked_out=false
+  for ((i = 0; i < TOTAL_WT; i++)); do
+    if [[ "${WT_BRANCHES[$i]}" == "$bname" ]]; then
+      checked_out=true
+      break
+    fi
+  done
+  if [[ "$checked_out" == "false" ]]; then
+    ahead_b=$(git rev-list --count "$TARGET_SHA..$bname" 2>/dev/null || echo "0")
+    if [[ "$ahead_b" -gt 0 ]]; then
+      b_sha=$(git rev-parse "$bname" 2>/dev/null || true)
+      b_merge=$(GIT_OBJECT_DIRECTORY="$SIM_OBJ_DIR" git merge-tree --write-tree "$TARGET_SHA" "$b_sha" 2>&1) || true
+      res_b_tree=$(printf "%s\n" "$b_merge" | head -n 1)
+      if [[ "$res_b_tree" != "$TARGET_TREE" ]]; then
+        ORPHAN_UNMERGED_BRANCHES+=("${bname}:::${ahead_b}")
+      fi
+    fi
+  fi
+done < <(git for-each-ref --format='%(refname:short)' refs/heads/)
+
+# ==================== RENDER AUDIT OUTPUT ====================
+
+echo "${C_BOLD}=== Worktree Sync Audit ===${C_RESET}"
+echo "Target branch : ${C_CYAN}${TARGET_BRANCH}${C_RESET} (${TARGET_SHORT}) — ${C_DIM}${TARGET_SUBJECT}${C_RESET}"
+if [[ -n "$MAJORITY_FORK" ]]; then
+  maj_short=$(git rev-parse --short "$MAJORITY_FORK")
+  maj_subj=$(git log -1 --format="%s (%cr)" "$MAJORITY_FORK")
+  echo "Cohort base   : ${C_BLUE}${maj_short}${C_RESET} — ${C_DIM}${maj_subj}${C_RESET}"
+fi
+echo "Total trees   : ${TOTAL_WT}"
+
+# Target placement warnings in header
+if [[ $TARGET_WT_IDX -gt 0 ]]; then
+  echo "${C_RED}${C_BOLD}🚨 TARGET BRANCH MISPLACED: '${TARGET_BRANCH}' is checked out in secondary worktree #$((TARGET_WT_IDX + 1)) (${WT_PATHS[$TARGET_WT_IDX]}), not primary!${C_RESET}"
+elif [[ $TARGET_WT_IDX -eq -1 ]]; then
+  echo "${C_YELLOW}⚠️ TARGET BRANCH '${TARGET_BRANCH}' IS NOT CHECKED OUT IN ANY WORKTREE.${C_RESET}"
+fi
+
+if [[ $TOTAL_WT -gt 0 && "${WT_BRANCHES[0]}" != "$TARGET_BRANCH" ]]; then
+  echo "${C_YELLOW}⚠️ PRIMARY WORKTREE ON '${WT_BRANCHES[0]}' (not '${TARGET_BRANCH}')${C_RESET}"
+fi
+echo ""
+
+# Render each worktree
+for ((i = 0; i < TOTAL_WT; i++)); do
+  wt_path="${WT_PATHS[$i]}"
+  wt_branch="${WT_BRANCHES[$i]}"
+  wt_head="${WT_HEADS[$i]}"
+  is_primary="${WT_IS_PRIMARY[$i]}"
+  is_missing="${WT_MISSING_DIR[$i]}"
+  is_locked="${WT_LOCKED[$i]}"
+  lock_reason="${WT_LOCK_REASONS[$i]}"
+  is_prunable="${WT_PRUNABLE[$i]}"
+  prune_reason="${WT_PRUNE_REASONS[$i]}"
+  nested_warn="${WT_NESTED_WARNINGS[$i]}"
+  active_op="${WT_ACTIVE_OPS[$i]}"
+  dirty_count="${WT_DIRTY_COUNTS[$i]}"
+  staged_count="${WT_STAGED_COUNTS[$i]}"
+  unstaged_count="${WT_UNSTAGED_COUNTS[$i]}"
+  untracked_count="${WT_UNTRACKED_COUNTS[$i]}"
+  unmerged_count="${WT_UNMERGED_COUNTS[$i]}"
+  suspicious_str="${WT_SUSPICIOUS_UNTRACKED[$i]}"
+  fork_sha="${WT_FORK_SHAS[$i]}"
+  ahead_count="${WT_AHEAD_COUNTS[$i]}"
+  behind_count="${WT_BEHIND_COUNTS[$i]}"
+  has_conflict_markers="${WT_CONFLICT_MARKERS[$i]}"
+  is_squash="${WT_SQUASH_MERGED[$i]}"
+  merge_outcome="${WT_MERGE_OUTCOMES[$i]}"
+  conflict_files="${WT_CONFLICT_FILES[$i]}"
+  overlap_files="${WT_OVERLAP_FILES[$i]}"
+  peer_conflicts="${WT_PEER_CONFLICTS[$i]}"
+  is_cascade="${WT_CASCADE_CONFLICT[$i]}"
+  cascade_with="${WT_CASCADE_WITH[$i]}"
+
+  head_short=$(git rev-parse --short "$wt_head" 2>/dev/null || echo "???")
+  role_tag=""
+  [[ "$is_primary" == "true" ]] && role_tag=" ${C_DIM}(primary worktree)${C_RESET}"
+  badges=""
+  [[ "$is_missing" == "true" ]] && badges+=" ${C_RED}[👻 MISSING DIR]${C_RESET}"
+  [[ "$is_locked" == "true" ]] && badges+=" ${C_YELLOW}[🔒 LOCKED: ${lock_reason}]${C_RESET}"
+  [[ "$is_prunable" == "true" ]] && badges+=" ${C_DIM}[prunable: ${prune_reason}]${C_RESET}"
+
+  echo "${C_BOLD}$((i + 1)). 📁 ${wt_path}${C_RESET} [${C_CYAN}${wt_branch}${C_RESET} @ ${head_short}]${role_tag}${badges}"
+
+  # Show nested worktree alerts
+  if [[ -n "$nested_warn" ]]; then
+    while IFS= read -r nw; do
+      [[ -z "$nw" ]] && continue
+      echo "   │  ${C_RED}${nw}${C_RESET}"
+    done <<< "$nested_warn"
+  fi
+
+  # Show in-progress git operation alerts
+  if [[ -n "$active_op" && "$active_op" != "MISSING DIRECTORY" ]]; then
+    echo "   ├─ Operation : ${C_RED}${active_op}${C_RESET}"
+  fi
+
+  # 1. Base / Fork-Point History Check
+  if [[ -z "$fork_sha" ]]; then
+    echo "   ├─ Base      : ${C_RED}🚨 UNRELATED HISTORY (no common ancestor with ${TARGET_BRANCH}!)${C_RESET}"
+  else
+    fork_short=$(git rev-parse --short "$fork_sha" 2>/dev/null || echo "???")
+    fork_notes=()
+    if [[ "$fork_sha" == "$TARGET_SHA" ]]; then
+      fork_notes+=("${C_GREEN}matches ${TARGET_BRANCH} tip ✅${C_RESET}")
+    else
+      fork_notes+=("${C_YELLOW}${behind_count} commit(s) behind ${TARGET_BRANCH}${C_RESET}")
+    fi
+    if [[ -n "$MAJORITY_FORK" && "$is_primary" == "false" && ("$ahead_count" -gt 0 || "$dirty_count" -gt 0) && "$fork_sha" != "$MAJORITY_FORK" ]]; then
+      maj_short=$(git rev-parse --short "$MAJORITY_FORK")
+      fork_notes+=("${C_RED}⚠️  MISMATCHED BASE vs cohort (${fork_short} != ${maj_short})${C_RESET}")
+    fi
+    fork_joined=$(printf "%s, " "${fork_notes[@]}")
+    echo "   ├─ Base      : ${fork_short} (${fork_joined%, })"
+  fi
+
+  # 2. Working Tree & Commit State
+  state_parts=()
+  if [[ "$is_missing" == "true" ]]; then
+    state_parts+=("${C_RED}directory missing on disk${C_RESET}")
+  elif [[ "$dirty_count" -gt 0 ]]; then
+    detail_parts=()
+    [[ "$unmerged_count" -gt 0 ]] && detail_parts+=("${C_RED}${unmerged_count} unmerged/conflict${C_RESET}")
+    [[ "$staged_count" -gt 0 ]] && detail_parts+=("${staged_count} staged")
+    [[ "$unstaged_count" -gt 0 ]] && detail_parts+=("${unstaged_count} unstaged")
+    [[ "$untracked_count" -gt 0 ]] && detail_parts+=("${untracked_count} untracked")
+    d_joined=$(printf "%s, " "${detail_parts[@]}")
+    state_parts+=("${C_YELLOW}⚠️  ${dirty_count} uncommitted file(s) (${d_joined%, })${C_RESET}")
+  else
+    state_parts+=("${C_GREEN}clean tree${C_RESET}")
+  fi
+
+  if [[ "$ahead_count" == "?" ]]; then
+    state_parts+=("unknown commits ahead")
+  elif [[ "$ahead_count" -gt 0 ]]; then
+    state_parts+=("${C_MAGENTA}⬆️  ${ahead_count} commit(s) ahead of ${TARGET_BRANCH}${C_RESET}")
+  else
+    state_parts+=("0 commits ahead")
+  fi
+  state_joined=$(printf "%s, " "${state_parts[@]}")
+  echo "   ├─ State     : ${state_joined%, }"
+
+  # Print short status snippet if dirty
+  if [[ "$is_missing" == "false" && "$dirty_count" -gt 0 ]]; then
+    declare -a status_excl_args=()
+    while IFS= read -r n; do
+      [[ -z "$n" ]] && continue
+      status_excl_args+=(":(exclude)$n" ":(exclude)$n/**")
+    done <<< "${WT_NESTED_EXCLUDES[$i]}"
+    while IFS= read -r sline; do
+      [[ -z "$sline" ]] && continue
+      echo "   │              ${C_DIM}${sline}${C_RESET}"
+    done < <(git -C "$wt_path" status --short -- . "${status_excl_args[@]}" 2>/dev/null | head -n 6)
+    if [[ "$dirty_count" -gt 6 ]]; then
+      echo "   │              ${C_DIM}... and $((dirty_count - 6)) more file(s)${C_RESET}"
+    fi
+  fi
+
+  # Suspicious untracked files alert
+  if [[ -n "$suspicious_str" ]]; then
+    echo "   ├─ Suspicious: ${C_YELLOW}⚠️ Suspicious untracked: ${suspicious_str}${C_RESET}"
+  fi
+
+  # Leftover conflict markers alert
+  if [[ "$has_conflict_markers" == "true" ]]; then
+    echo "   ├─ Conflict  : ${C_RED}🚨 LEFTOVER CONFLICT MARKERS IN FILES (contains <<<<<<< markers)${C_RESET}"
+  fi
+
+  # 3. Merge & Conflict Readiness
+  if [[ "$merge_outcome" == "TARGET" ]]; then
+    upstream=$(git -C "$wt_path" rev-parse --abbrev-ref --symbolic-full-name "@{u}" 2>/dev/null || true)
+    if [[ -n "$upstream" ]]; then
+      unpushed=$(git -C "$wt_path" rev-list --count "$upstream..HEAD" 2>/dev/null || echo "0")
+      echo "   └─ Remote    : Tracking ${upstream} (${unpushed} unpushed commit(s))"
+    else
+      echo "   └─ Remote    : No upstream configured"
+    fi
+  elif [[ "$merge_outcome" == "ALREADY_MERGED" ]]; then
+    echo "   └─ Merge     : ${C_GREEN}✅ Already merged / identical to ${TARGET_BRANCH} (safe to prune)${C_RESET}"
+  elif [[ "$merge_outcome" == "BROKEN_OP" ]]; then
+    echo "   └─ Merge     : ${C_RED}⛔ Blocked by active Git operation / unresolved conflicts (resolve or abort in worktree first)${C_RESET}"
+  elif [[ "$merge_outcome" == "SQUASH" ]]; then
+    echo "   └─ Merge     : ${C_GREEN}✅ Already integrated into ${TARGET_BRANCH} (squash/patch-equivalent, 0 net diff — safe to prune)${C_RESET}"
+  elif [[ "$merge_outcome" == "UNRELATED" ]]; then
+    echo "   └─ Merge     : ${C_RED}⛔ Cannot auto-merge unrelated history${C_RESET}"
+  elif [[ "$merge_outcome" == "BLOCKED_DIRTY_TARGET_CLEAN" ]]; then
+    echo "   ├─ Merge     : ${C_YELLOW}⚠️ BLOCKED BY DIRTY '${TARGET_BRANCH}' (overlaps uncommitted file(s) in ${TARGET_BRANCH}: ${conflict_files}; commit/stash ${TARGET_BRANCH} first; 3-way merge of edits is CLEAN ✅)${C_RESET}"
+  elif [[ "$merge_outcome" == "CONFLICT_DIRTY_TARGET" ]]; then
+    echo "   ├─ Merge     : ${C_RED}❌ CONFLICTS WITH UNCOMMITTED WORK IN '${TARGET_BRANCH}'${C_RESET}"
+    while IFS= read -r cf; do
+      [[ -z "$cf" ]] && continue
+      echo "   │              - ${C_RED}${cf}${C_RESET}"
+    done <<< "$conflict_files"
+  elif [[ "$merge_outcome" == "CLEAN" ]]; then
+    if [[ "$is_cascade" == "true" ]]; then
+      echo "   ├─ Merge     : ${C_RED}💥 CASCADE CONFLICT (clean against ${TARGET_BRANCH} alone, but conflicts after merging earlier branch '${cascade_with}')${C_RESET}"
+    elif [[ -n "$peer_conflicts" ]]; then
+      echo "   ├─ Merge     : ${C_GREEN}✅ Clean against current ${TARGET_BRANCH}${C_RESET}, ${C_RED}💥 CONFLICTS with peer worktree: ${peer_conflicts}${C_RESET}"
+    elif [[ -n "$overlap_files" ]]; then
+      echo "   ├─ Merge     : ${C_GREEN}✅ Clean text merge into ${TARGET_BRANCH} (and with peers)${C_RESET}"
+    else
+      echo "   └─ Merge     : ${C_GREEN}✅ Clean merge into ${TARGET_BRANCH} (no file overlaps)${C_RESET}"
+    fi
+
+    if [[ -n "$overlap_files" ]]; then
+      echo "   └─ Overlap   : ${C_YELLOW}👀 SEMANTIC OVERLAP (same file touched — verify combined logic):${C_RESET}"
+      while IFS= read -r ofile; do
+        [[ -z "$ofile" ]] && continue
+        echo "                  - ${ofile}"
+      done <<< "$overlap_files"
+    fi
+  elif [[ "$merge_outcome" == "CONFLICT" ]]; then
+    # Check if lockfile-only conflict
+    all_lockfiles=true
+    while IFS= read -r cf; do
+      [[ -z "$cf" ]] && continue
+      if ! is_lockfile "$cf"; then
+        all_lockfiles=false
+        break
+      fi
+    done <<< "$conflict_files"
+
+    if [[ "$all_lockfiles" == "true" && -n "$conflict_files" ]]; then
+      echo "   ├─ Merge     : ${C_YELLOW}⚠️ LOCKFILE-ONLY CONFLICT (merge manifest & regenerate lockfile)${C_RESET}"
+    else
+      echo "   ├─ Merge     : ${C_RED}❌ TEXT CONFLICT with ${TARGET_BRANCH}${C_RESET}"
+    fi
+    while IFS= read -r cf; do
+      [[ -z "$cf" ]] && continue
+      echo "   │              - ${cf}"
+    done <<< "$conflict_files"
+    echo "   └─ Action    : Rebase branch inside '${wt_path}' ('git rebase ${TARGET_BRANCH}') or resolve in integrator."
+  fi
+  echo ""
+done
+
+# Orphan unmerged branches
+if [[ ${#ORPHAN_UNMERGED_BRANCHES[@]} -gt 0 ]]; then
+  echo "${C_BOLD}=== Unmerged Local Branches (No Active Worktree) ===${C_RESET}"
+  for ob in "${ORPHAN_UNMERGED_BRANCHES[@]}"; do
+    b_name="${ob%%:::*}"
+    b_ahead="${ob##*:::}"
+    echo "  📌 ${C_CYAN}${b_name}${C_RESET} (${C_MAGENTA}${b_ahead} commit(s) ahead${C_RESET} of ${TARGET_BRANCH})"
+  done
+  echo ""
+fi
+
+# Stashes footer
+if [[ "$stash_count" -gt 0 ]]; then
+  echo "${C_BOLD}=== Git Stashes ===${C_RESET}"
+  echo "Stashes found : ${stash_count} stash entry(ies)"
+  while IFS= read -r sline; do
+    [[ -z "$sline" ]] && continue
+    echo "  ${C_DIM}${sline}${C_RESET}"
+  done < <(git stash list -n 3 2>/dev/null || true)
+  echo ""
+fi
+
+# ==================== PRUNING EXECUTION ====================
+if [[ "$PRUNE_MERGED" == true ]]; then
+  if [[ ${#PRUNE_CANDIDATES[@]} -eq 0 ]]; then
+    echo "${C_DIM}No clean or squash-merged secondary worktrees to prune.${C_RESET}"
+  else
+    echo "${C_BOLD}=== Pruning Clean & Merged Worktrees ===${C_RESET}"
+    for entry in "${PRUNE_CANDIDATES[@]}"; do
+      IFS=$'\t' read -r p_path p_branch p_mode p_locked p_lock_reason <<< "$entry"
+
+      if [[ "$p_locked" == "true" ]]; then
+        echo "   ${C_YELLOW}⚠️ Skipping locked worktree: ${p_path} [${p_branch}] (${p_lock_reason})${C_RESET}"
+        continue
+      fi
+
+      echo "Removing worktree: ${p_path} [${p_branch}]..."
+      if [[ -d "$p_path" ]]; then
+        if ! git worktree remove "$p_path" 2>/dev/null; then
+          echo "   ${C_YELLOW}⚠️ Could not remove '${p_path}' without --force (may contain submodules or untracked/ignored files); skipping.${C_RESET}"
+          continue
+        fi
+      fi
+
+      if [[ "$p_branch" != "(detached)" ]]; then
+        if [[ "$p_mode" == "squash" ]]; then
+          git branch -D "$p_branch" 2>/dev/null || true
+        else
+          git branch -d "$p_branch" 2>/dev/null || true
+        fi
+      fi
+    done
+    git worktree prune 2>/dev/null || true
+    echo "${C_GREEN}Pruning complete.${C_RESET}"
+  fi
+  echo ""
+fi
+
+# ==================== RECOMMENDED INTEGRATION PLAN ====================
+echo "${C_BOLD}=== Recommended Integration Plan ===${C_RESET}"
+
+step_num=1
+
+# Check if stabilization is needed
+has_stuck_ops=false
+has_misplaced=false
+has_nested_warn=false
+has_dirty=false
+
+for ((i = 0; i < TOTAL_WT; i++)); do
+  [[ -n "${WT_ACTIVE_OPS[$i]}" && "${WT_ACTIVE_OPS[$i]}" != "MISSING DIRECTORY" ]] && has_stuck_ops=true
+  [[ -n "${WT_NESTED_WARNINGS[$i]}" ]] && has_nested_warn=true
+  [[ "${WT_DIRTY_COUNTS[$i]}" -gt 0 ]] && has_dirty=true
+done
+if [[ $TARGET_WT_IDX -gt 0 || ($TOTAL_WT -gt 0 && "${WT_BRANCHES[0]}" != "$TARGET_BRANCH") ]]; then
+  has_misplaced=true
+fi
+
+if [[ "$has_stuck_ops" == true || "$has_nested_warn" == true || "$has_misplaced" == true ]]; then
+  echo "${step_num}. 🛠️  ${C_BOLD}Stabilize repository & worktree configuration:${C_RESET}"
+  if [[ "$has_misplaced" == true ]]; then
+    echo "   - Ensure primary worktree is checked out on '${TARGET_BRANCH}'."
+  fi
+  if [[ "$has_stuck_ops" == true ]]; then
+    echo "   - Finish or abort in-progress rebase/merge/cherry-pick operations; clear stale index.lock files if crashed."
+  fi
+  if [[ "$has_nested_warn" == true ]]; then
+    echo "   - Add nested worktree directory paths to .git/info/exclude or .gitignore so they are not tracked as dirty files."
+  fi
+  step_num=$((step_num + 1))
+fi
+
+if [[ "$has_dirty" == true ]]; then
+  echo "${step_num}. 💾 ${C_BOLD}Triage uncommitted changes:${C_RESET}"
+  if [[ $TARGET_WT_IDX -ge 0 && "${WT_DIRTY_COUNTS[$TARGET_WT_IDX]}" -gt 0 ]]; then
+    echo "   - Primary/Target '${TARGET_BRANCH}': Stage and commit finished edits, or run 'git stash push -u -m \"wt-sync: pre-merge target WIP\"' to unblock merges."
+  fi
+  for ((i = 0; i < TOTAL_WT; i++)); do
+    [[ $i -eq $TARGET_WT_IDX ]] && continue
+    if [[ "${WT_DIRTY_COUNTS[$i]}" -gt 0 ]]; then
+      b_label=$(format_wt_label "$i")
+      echo "   - Worktree '${WT_PATHS[$i]}' [${b_label}]: Commit legitimate finished work (exclude secrets/junk) or attach branch if detached ('git checkout -b wt/<name>')."
+    fi
+  done
+  step_num=$((step_num + 1))
+fi
+
+# Merging order
+if [[ ${#CLEAN_NON_OVERLAP_IDXS[@]} -gt 0 ]]; then
+  has_clean_non_overlap=false
+  for k in "${CLEAN_NON_OVERLAP_IDXS[@]}"; do
+    if [[ "${WT_CASCADE_CONFLICT[$k]}" != "true" ]]; then
+      has_clean_non_overlap=true
+      break
+    fi
+  done
+  if [[ "$has_clean_non_overlap" == true ]]; then
+    echo "${step_num}. 🔀 ${C_BOLD}Merge independent clean worktrees:${C_RESET}"
+    for k in "${CLEAN_NON_OVERLAP_IDXS[@]}"; do
+      if [[ "${WT_CASCADE_CONFLICT[$k]}" != "true" ]]; then
+        b_label=$(format_wt_label "$k")
+        if [[ "${WT_BRANCHES[$k]}" == "(detached)" ]]; then
+          echo "   - [${b_label}] Attach branch: 'git -C \"${WT_PATHS[$k]}\" checkout -b wt/$(basename "${WT_PATHS[$k]}")' && git merge --no-ff wt/$(basename "${WT_PATHS[$k]}")"
+        else
+          echo "   - git merge --no-ff '${WT_BRANCHES[$k]}' -m \"Merge branch '${WT_BRANCHES[$k]}'\""
+        fi
+      fi
+    done
+    step_num=$((step_num + 1))
+  fi
+fi
+
+if [[ ${#CLEAN_OVERLAP_IDXS[@]} -gt 0 ]]; then
+  has_clean_overlap=false
+  for k in "${CLEAN_OVERLAP_IDXS[@]}"; do
+    if [[ "${WT_CASCADE_CONFLICT[$k]}" != "true" ]]; then
+      has_clean_overlap=true
+      break
+    fi
+  done
+  if [[ "$has_clean_overlap" == true ]]; then
+    echo "${step_num}. 🔍 ${C_BOLD}Merge overlapping clean worktrees & inspect combined symbols:${C_RESET}"
+    for k in "${CLEAN_OVERLAP_IDXS[@]}"; do
+      if [[ "${WT_CASCADE_CONFLICT[$k]}" != "true" ]]; then
+        b_label=$(format_wt_label "$k")
+        if [[ "${WT_BRANCHES[$k]}" == "(detached)" ]]; then
+          echo "   - [${b_label}] Attach branch: 'git -C \"${WT_PATHS[$k]}\" checkout -b wt/$(basename "${WT_PATHS[$k]}")' && git merge --no-ff wt/$(basename "${WT_PATHS[$k]}")"
+        else
+          echo "   - git merge --no-ff '${WT_BRANCHES[$k]}' -m \"Merge branch '${WT_BRANCHES[$k]}'\""
+        fi
+        echo "     (Inspect shared symbols; run project test suite before proceeding)"
+      fi
+    done
+    step_num=$((step_num + 1))
+  fi
+fi
+
+# Clean branches blocked only by dirty target
+declare -a BLOCKED_DIRTY_CLEAN_IDXS=()
+for ((i = 0; i < TOTAL_WT; i++)); do
+  if [[ "${WT_MERGE_OUTCOMES[$i]}" == "BLOCKED_DIRTY_TARGET_CLEAN" ]]; then
+    BLOCKED_DIRTY_CLEAN_IDXS+=("$i")
+  fi
+done
+
+if [[ ${#BLOCKED_DIRTY_CLEAN_IDXS[@]} -gt 0 ]]; then
+  echo "${step_num}. 🔀 ${C_BOLD}Merge clean worktrees unblocked after committing/stashing '${TARGET_BRANCH}':${C_RESET}"
+  for k in "${BLOCKED_DIRTY_CLEAN_IDXS[@]}"; do
+    b_label=$(format_wt_label "$k")
+    if [[ "${WT_BRANCHES[$k]}" == "(detached)" ]]; then
+      echo "   - [${b_label}] Attach branch: 'git -C \"${WT_PATHS[$k]}\" checkout -b wt/$(basename "${WT_PATHS[$k]}")' && git merge --no-ff wt/$(basename "${WT_PATHS[$k]}") (after committing or stashing '${TARGET_BRANCH}')"
+    else
+      echo "   - git merge --no-ff '${WT_BRANCHES[$k]}' -m \"Merge branch '${WT_BRANCHES[$k]}'\" (after committing or stashing '${TARGET_BRANCH}')"
+    fi
+  done
+  step_num=$((step_num + 1))
+fi
+
+# Conflicting worktrees
+has_conflicts=false
+for ((i = 0; i < TOTAL_WT; i++)); do
+  if [[ "${WT_MERGE_OUTCOMES[$i]}" == "CONFLICT"* || "${WT_CASCADE_CONFLICT[$i]}" == "true" ]]; then
+    has_conflicts=true
+    break
+  fi
+done
+
+if [[ "$has_conflicts" == true ]]; then
+  echo "${step_num}. ⚡ ${C_BOLD}Resolve conflicting branches:${C_RESET}"
+  for ((i = 0; i < TOTAL_WT; i++)); do
+    outcome="${WT_MERGE_OUTCOMES[$i]}"
+    cascade="${WT_CASCADE_CONFLICT[$i]}"
+    if [[ "$outcome" == "CONFLICT"* || "$cascade" == "true" ]]; then
+      b_label=$(format_wt_label "$i")
+      wt_p="${WT_PATHS[$i]}"
+      if [[ "$cascade" == "true" ]]; then
+        echo "   - [${b_label}] Cascade conflict: rebase inside '${wt_p}' on updated '${TARGET_BRANCH}' ('git rebase ${TARGET_BRANCH}')."
+      elif [[ "$outcome" == "CONFLICT" ]]; then
+        echo "   - [${b_label}] Rebase inside '${wt_p}' ('git rebase ${TARGET_BRANCH}'), resolve conflicts / regenerate lockfiles, and run tests."
+      elif [[ "$outcome" == "CONFLICT_DIRTY_TARGET" ]]; then
+        echo "   - [${b_label}] Conflicts with uncommitted edits in '${TARGET_BRANCH}' — commit/stash '${TARGET_BRANCH}' first, then rebase/resolve."
+      fi
+    fi
+  done
+  step_num=$((step_num + 1))
+fi
+
+echo "${step_num}. 🧹 ${C_BOLD}Clean up finished secondary worktrees:${C_RESET}"
+echo "   - Run 'git wt-sync --prune-merged' to safely remove clean and squash-merged worktrees and delete local branches."

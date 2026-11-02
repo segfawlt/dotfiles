@@ -1,0 +1,12 @@
+{
+  "name": "advisor",
+  "displayName": "Persistent Advisor Subagent",
+  "version": "3.0.0",
+  "description": "Continuous 1-to-1 isolated Advisor (advisor-core) for mutating sessions (Lead + self): commit-aware finish-line diff checks, thrash circuit-breaker, project memories + WATCHDOG.md, and agy stats telemetry.",
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "/advisor status",
+    "/advisor subagents",
+    "/advisor logs"
+  ]
+}

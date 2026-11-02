@@ -1,0 +1,1038 @@
+#!/usr/bin/env python3
+"""
+agent-memory: Shared 2-Stage Consolidated Memory Engine for Antigravity (agy) & Pi.
+Storage root: ~/.agents/memories/
+  - memory.db (SQLite watermarks + FTS5 BM25 index)
+  - state.json (enabled toggle, consolidation model, last sync timestamp)
+  - <workspace-slug>/
+      - memory_summary.md  (~280 tokens, injected once at SessionStart)
+      - MEMORY.md          (curated long-term handbook, read on demand)
+      - raw_memories.md    (Stage-1 extracted durable notes)
+      - rollout_summaries/ (per-session distilled summaries)
+      - skills/            (auto-extracted domain SKILL.md playbooks)
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import fcntl
+import glob
+import json
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+HOME = Path.home()
+MEM_ROOT = HOME / ".agents" / "memories"
+STATE_PATH = MEM_ROOT / "state.json"
+DB_PATH = MEM_ROOT / "memory.db"
+LOCK_PATH = MEM_ROOT / "sync.lock"
+AGY_BRAIN_DIR = HOME / ".gemini" / "antigravity-cli" / "brain"
+AGY_HISTORY_PATH = HOME / ".gemini" / "antigravity-cli" / "history.jsonl"
+AGY_SKILLS_JSON = HOME / ".gemini" / "config" / "skills.json"
+PI_SESSIONS_DIR = HOME / ".pi" / "agent" / "sessions"
+
+INTERNAL_MARKER = "[AGY_INTERNAL_WORKER]"
+DEFAULT_MODEL = "gemini-3.8-flash-low"
+SYNC_COOLDOWN_SEC = 1200  # 20 minutes between automatic background checks
+MIN_IDLE_SEC = 1800       # Only distill transcripts idle >= 30 minutes (unless --force)
+
+SECRET_PATTERNS = [
+    (re.compile(r"\bsk-[A-Za-z0-9_-]{16,}\b"), "sk-[REDACTED]"),
+    (re.compile(r"\bAIza[0-9A-Za-z_-]{30,}\b"), "AIza[REDACTED]"),
+    (re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b"), "gh_[REDACTED]"),
+    (re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]{20,}"), r"\1[REDACTED]"),
+    (re.compile(r"(?i)(\b[A-Z0-9_]*(?:SECRET|TOKEN|API_KEY|PASSWORD|PASSWD)[A-Z0-9_]*\s*[:=]\s*['\"]?)([^\s'\"]{8,})"), r"\1[REDACTED]"),
+    (re.compile(r"(https?://[^/\s:@]+:)([^@\s/]+)(@)"), r"\1[REDACTED]\3"),
+]
+
+STAGE1_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "rollout_summary": {"type": "string"},
+        "rollout_slug": {"type": "string"},
+        "raw_memory": {"type": "string"},
+    },
+    "required": ["rollout_summary", "rollout_slug", "raw_memory"],
+}
+
+STAGE2_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "memory_summary": {"type": "string"},
+        "memory_md": {"type": "string"},
+        "skills": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "description": {"type": "string"},
+                    "content": {"type": "string"},
+                },
+                "required": ["name", "description", "content"],
+            },
+        },
+    },
+    "required": ["memory_summary", "memory_md", "skills"],
+}
+
+
+def redact_secrets(text: str) -> str:
+    for pattern, repl in SECRET_PATTERNS:
+        text = pattern.sub(repl, text)
+    return text
+
+
+def load_state() -> dict[str, Any]:
+    MEM_ROOT.mkdir(parents=True, exist_ok=True)
+    default = {
+        "enabled": True,
+        "model": DEFAULT_MODEL,
+        "last_auto_sync": 0.0,
+    }
+    if not STATE_PATH.exists():
+        return default
+    try:
+        data = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            default.update(data)
+    except Exception:
+        pass
+    return default
+
+
+def save_state(state: dict[str, Any]) -> None:
+    MEM_ROOT.mkdir(parents=True, exist_ok=True)
+    tmp = STATE_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(STATE_PATH)
+
+
+def resolve_workspace_root(raw_path: str | Path) -> Path:
+    p = Path(raw_path).expanduser()
+    try:
+        p = p.resolve()
+    except Exception:
+        p = Path(os.path.abspath(str(p)))
+    check_dir = p if p.is_dir() else p.parent
+    if check_dir.exists():
+        try:
+            proc = subprocess.run(
+                ["git", "-C", str(check_dir), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+            if proc.returncode == 0:
+                common_git = Path(proc.stdout.strip())
+                if common_git.name == ".git":
+                    return common_git.parent.resolve()
+        except Exception:
+            pass
+    return check_dir
+
+
+def cwd_to_slug(cwd: str | Path) -> str:
+    root = resolve_workspace_root(cwd)
+    cleaned = str(root).strip("/").replace("/", "-")
+    return f"--{cleaned}--" if cleaned else "--root--"
+
+
+def should_auto_track_workspace(cwd: str | Path) -> bool:
+    root = resolve_workspace_root(cwd)
+    slug = cwd_to_slug(root)
+    if (MEM_ROOT / slug).is_dir():
+        return True
+    s = str(root)
+    if s in ("/", "/tmp", "/var/tmp", str(HOME)):
+        return False
+    if s.startswith("/tmp/") or s.startswith("/var/tmp/"):
+        return False
+    return True
+
+
+def open_db() -> sqlite3.Connection:
+    MEM_ROOT.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(DB_PATH), timeout=5.0)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS session_workspaces (
+            conversation_id TEXT PRIMARY KEY,
+            workspace_path TEXT NOT NULL,
+            workspace_slug TEXT NOT NULL,
+            updated_at REAL NOT NULL
+        );
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS processed_threads (
+            thread_id TEXT PRIMARY KEY,
+            harness TEXT NOT NULL,
+            workspace_slug TEXT NOT NULL,
+            mtime REAL NOT NULL,
+            stage1_status TEXT NOT NULL,
+            consolidated INTEGER NOT NULL DEFAULT 0,
+            rollout_file TEXT,
+            updated_at TEXT NOT NULL
+        );
+        """
+    )
+    conn.execute(
+        """
+        CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
+            workspace_slug,
+            doc_type,
+            doc_id,
+            title,
+            content
+        );
+        """
+    )
+    conn.commit()
+    return conn
+
+
+def sync_skills_json() -> int:
+    """Ensure workspace-specific ~/.agents/memories/* skills are NOT leaked into global skills.json."""
+    if not AGY_SKILLS_JSON.is_file():
+        return 0
+    try:
+        loaded = json.loads(AGY_SKILLS_JSON.read_text(encoding="utf-8"))
+    except Exception:
+        return 0
+    if not isinstance(loaded, dict):
+        return 0
+
+    raw_entries = loaded.get("entries", [])
+    cleaned = [
+        e for e in raw_entries
+        if isinstance(e, dict) and not str(e.get("path", "")).startswith("~/.agents/memories/")
+    ]
+    if len(cleaned) != len(raw_entries):
+        if cleaned:
+            loaded["entries"] = cleaned
+            tmp = AGY_SKILLS_JSON.with_suffix(".tmp")
+            tmp.write_text(json.dumps(loaded, indent=2) + "\n", encoding="utf-8")
+            tmp.replace(AGY_SKILLS_JSON)
+        else:
+            AGY_SKILLS_JSON.unlink(missing_ok=True)
+    return len(cleaned)
+
+
+def reindex_fts(conn: sqlite3.Connection, target_slug: str | None = None) -> int:
+    if target_slug:
+        conn.execute("DELETE FROM documents_fts WHERE workspace_slug = ?", (target_slug,))
+        dirs = [MEM_ROOT / target_slug] if (MEM_ROOT / target_slug).is_dir() else []
+    else:
+        conn.execute("DELETE FROM documents_fts")
+        dirs = [d for d in sorted(MEM_ROOT.iterdir()) if d.is_dir() and d.name.startswith("--")]
+
+    count = 0
+    for ws_dir in dirs:
+        slug = ws_dir.name
+        mem_md = ws_dir / "MEMORY.md"
+        if mem_md.is_file():
+            conn.execute(
+                "INSERT INTO documents_fts (workspace_slug, doc_type, doc_id, title, content) VALUES (?, ?, ?, ?, ?)",
+                (slug, "memory_md", str(mem_md), f"{slug}/MEMORY.md", mem_md.read_text(encoding="utf-8", errors="replace")),
+            )
+            count += 1
+        sum_md = ws_dir / "memory_summary.md"
+        if sum_md.is_file():
+            conn.execute(
+                "INSERT INTO documents_fts (workspace_slug, doc_type, doc_id, title, content) VALUES (?, ?, ?, ?, ?)",
+                (slug, "summary", str(sum_md), f"{slug}/memory_summary.md", sum_md.read_text(encoding="utf-8", errors="replace")),
+            )
+            count += 1
+        sdir = ws_dir / "skills"
+        if sdir.is_dir():
+            for child in sorted(sdir.iterdir()):
+                sk = child / "SKILL.md"
+                if child.is_dir() and sk.is_file():
+                    conn.execute(
+                        "INSERT INTO documents_fts (workspace_slug, doc_type, doc_id, title, content) VALUES (?, ?, ?, ?, ?)",
+                        (slug, "skill", str(sk), f"skill:{child.name}", sk.read_text(encoding="utf-8", errors="replace")),
+                    )
+                    count += 1
+        rdir = ws_dir / "rollout_summaries"
+        if rdir.is_dir():
+            for rf in sorted(rdir.glob("*.md")):
+                conn.execute(
+                    "INSERT INTO documents_fts (workspace_slug, doc_type, doc_id, title, content) VALUES (?, ?, ?, ?, ?)",
+                    (slug, "rollout", str(rf), rf.name, rf.read_text(encoding="utf-8", errors="replace")),
+                )
+                count += 1
+    conn.commit()
+    return count
+
+
+def find_agy_binary() -> str:
+    for candidate in [
+        shutil.which("agy"),
+        str(HOME / ".gemini" / "antigravity-cli" / "bin" / "agy"),
+        str(HOME / ".local" / "bin" / "agy"),
+    ]:
+        if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    raise RuntimeError("agy binary not found")
+
+
+def call_llm_json(prompt_text: str, schema: dict[str, Any], model: str, timeout: int = 90) -> dict[str, Any] | None:
+    agy_bin = find_agy_binary()
+    env = os.environ.copy()
+    env["AGY_HOOK_INTERNAL"] = "1"
+    existing_brains = set(os.listdir(AGY_BRAIN_DIR)) if AGY_BRAIN_DIR.is_dir() else set()
+    ephemeral_cid = ""
+    cmd = [
+        agy_bin,
+        "--model",
+        model,
+        "--disable-slash-commands",
+        "--output-format",
+        "json",
+        "--json-schema",
+        json.dumps(schema),
+        f"--print={INTERNAL_MARKER}\n{prompt_text}",
+    ]
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            env=env,
+            cwd="/tmp",
+            timeout=timeout,
+        )
+        if proc.returncode != 0:
+            return None
+        out = proc.stdout.strip()
+        if not out:
+            return None
+        envelope = json.loads(out)
+        ephemeral_cid = str(envelope.get("conversation_id") or "")
+        if isinstance(envelope.get("structured_output"), dict):
+            return envelope["structured_output"]
+        resp_text = str(envelope.get("response") or "").strip()
+        if resp_text:
+            return json.loads(resp_text)
+        return None
+    except Exception:
+        return None
+    finally:
+        try:
+            cleaned_cids: set[str] = set()
+            if ephemeral_cid:
+                cleaned_cids.add(ephemeral_cid)
+                if (AGY_BRAIN_DIR / ephemeral_cid).is_dir():
+                    shutil.rmtree(AGY_BRAIN_DIR / ephemeral_cid, ignore_errors=True)
+            if AGY_BRAIN_DIR.is_dir():
+                for nb in set(os.listdir(AGY_BRAIN_DIR)) - existing_brains:
+                    tpath = AGY_BRAIN_DIR / nb / ".system_generated" / "logs" / "transcript.jsonl"
+                    if tpath.is_file():
+                        first = tpath.open("r", encoding="utf-8", errors="ignore").readline()
+                        if INTERNAL_MARKER in first:
+                            cleaned_cids.add(nb)
+                            shutil.rmtree(AGY_BRAIN_DIR / nb, ignore_errors=True)
+            conv_pb_dir = HOME / ".gemini" / "antigravity-cli" / "conversations"
+            conv_sum_db = HOME / ".gemini" / "antigravity-cli" / "conversation_summaries.db"
+            for ccid in cleaned_cids:
+                pb_file = conv_pb_dir / f"{ccid}.pb"
+                if pb_file.is_file():
+                    pb_file.unlink(missing_ok=True)
+            if cleaned_cids and conv_sum_db.is_file():
+                sconn = sqlite3.connect(str(conv_sum_db), timeout=3.0)
+                sconn.executemany(
+                    "DELETE FROM conversation_summaries WHERE conversation_id = ?",
+                    [(c,) for c in cleaned_cids],
+                )
+                sconn.commit()
+                sconn.close()
+        except Exception:
+            pass
+
+
+def load_history_workspace_map(conn: sqlite3.Connection) -> dict[str, str]:
+    mapping: dict[str, str] = {}
+    for cid, wpath in conn.execute("SELECT conversation_id, workspace_path FROM session_workspaces"):
+        mapping[cid] = wpath
+    if AGY_HISTORY_PATH.is_file():
+        try:
+            with AGY_HISTORY_PATH.open("r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                        cid = obj.get("conversationId")
+                        ws = obj.get("workspace")
+                        if cid and ws and cid not in mapping:
+                            mapping[cid] = ws
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+    return mapping
+
+
+def extract_agy_transcript_digest(tpath: Path, max_chars: int = 28000) -> str | None:
+    try:
+        lines = tpath.read_text(encoding="utf-8", errors="replace").splitlines()
+    except Exception:
+        return None
+    if len(lines) < 4:
+        return None
+    try:
+        first = json.loads(lines[0])
+    except Exception:
+        return None
+    # Skip subagent transcripts (step 0 is SYSTEM_MESSAGE) and internal worker calls
+    if first.get("type") != "USER_INPUT":
+        return None
+    first_content = str(first.get("content", ""))
+    if INTERNAL_MARKER in first_content:
+        return None
+
+    chunks: list[str] = []
+    user_turns = 0
+    assistant_turns = 0
+    for raw in lines:
+        try:
+            step = json.loads(raw)
+        except Exception:
+            continue
+        stype = step.get("type")
+        if stype == "USER_INPUT":
+            user_turns += 1
+            txt = redact_secrets(str(step.get("content", "")).strip())
+            if txt:
+                chunks.append(f"[USER]\n{txt[:2500]}")
+        elif stype == "PLANNER_RESPONSE":
+            tcalls = step.get("tool_calls") or []
+            tnames = [tc.get("name", "") for tc in tcalls if isinstance(tc, dict) and tc.get("name")]
+            txt = redact_secrets(str(step.get("content", "")).strip())
+            if txt or tnames:
+                assistant_turns += 1
+                header = f"[ASSISTANT tools={','.join(tnames[:6])}]" if tnames else "[ASSISTANT]"
+                chunks.append(f"{header}\n{txt[:2500]}" if txt else header)
+
+    if user_turns < 1 or assistant_turns < 1:
+        return None
+    joined = "\n\n".join(chunks)
+    if len(joined) > max_chars:
+        half = max_chars // 2
+        joined = joined[:half] + "\n\n...[middle truncated]...\n\n" + joined[-half:]
+    return joined
+
+
+def extract_pi_transcript_digest(spath: Path, max_chars: int = 28000) -> tuple[str | None, str | None]:
+    """Parse Pi session JSONL -> (cwd, digest)."""
+    try:
+        lines = spath.read_text(encoding="utf-8", errors="replace").splitlines()
+    except Exception:
+        return None, None
+    if len(lines) < 4:
+        return None, None
+    cwd = None
+    chunks: list[str] = []
+    for raw in lines:
+        try:
+            obj = json.loads(raw)
+        except Exception:
+            continue
+        otype = obj.get("type")
+        if otype == "session" and obj.get("cwd"):
+            cwd = obj["cwd"]
+        elif otype == "message":
+            msg = obj.get("message") or {}
+            role = msg.get("role")
+            content = msg.get("content")
+            text_parts: list[str] = []
+            if isinstance(content, str):
+                text_parts.append(content)
+            elif isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        text_parts.append(str(part.get("text", "")))
+            if role in ("user", "assistant") and text_parts:
+                txt = redact_secrets("\n".join(text_parts).strip())
+                if INTERNAL_MARKER in txt:
+                    return None, None
+                chunks.append(f"[{role.upper()}]\n{txt[:2500]}")
+    if not cwd or len(chunks) < 2:
+        return None, None
+    joined = "\n\n".join(chunks)
+    if len(joined) > max_chars:
+        half = max_chars // 2
+        joined = joined[:half] + "\n\n...[middle truncated]...\n\n" + joined[-half:]
+    return cwd, joined
+
+
+def run_stage1(thread_id: str, digest: str, model: str) -> dict[str, Any] | None:
+    prompt = f"""You are a Stage-1 repository memory extractor.
+Return strict JSON matching the schema.
+Distill ONLY reusable, durable engineering knowledge from this completed session:
+- Concrete architecture facts, invariants, resolved bug root-causes, durable pitfalls, verified commands, or user workflow decisions.
+- NEVER include transient chatter, greetings, or speculative guesses that were disproved.
+- If the session contains NO durable reusable repository signal (e.g. trivial Q&A or aborted chat), return empty strings for rollout_summary and raw_memory and null for rollout_slug.
+
+Session ID: {thread_id}
+Transcript digest:
+{digest}
+"""
+    return call_llm_json(prompt, STAGE1_SCHEMA, model=model, timeout=90)
+
+
+def run_stage2(ws_dir: Path, model: str) -> bool:
+    mem_md_path = ws_dir / "MEMORY.md"
+    sum_md_path = ws_dir / "memory_summary.md"
+    raw_path = ws_dir / "raw_memories.md"
+    rdir = ws_dir / "rollout_summaries"
+    sdir = ws_dir / "skills"
+
+    prior_memory = mem_md_path.read_text(encoding="utf-8", errors="replace") if mem_md_path.is_file() else ""
+    recent_raw = ""
+    if raw_path.is_file():
+        recent_raw = raw_path.read_text(encoding="utf-8", errors="replace")[-24000:]
+    recent_rollouts: list[str] = []
+    if rdir.is_dir():
+        for rf in sorted(rdir.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True)[:12]:
+            recent_rollouts.append(f"### {rf.name}\n" + rf.read_text(encoding="utf-8", errors="replace")[:2000])
+
+    existing_skills: list[str] = []
+    if sdir.is_dir():
+        for child in sorted(sdir.iterdir()):
+            sk = child / "SKILL.md"
+            if child.is_dir() and sk.is_file():
+                existing_skills.append(f"### Skill: {child.name}\n" + sk.read_text(encoding="utf-8", errors="replace")[:3000])
+
+    prompt = f"""You are a Stage-2 repository memory consolidator.
+Consolidate the prior MEMORY.md with new Stage-1 raw memories and rollout summaries.
+Rules:
+1. `memory_summary`: A single dense paragraph (180-320 words max) summarizing canonical repo architecture, operating rules, shipped capabilities, and top active pitfalls. Injected at SessionStart.
+2. `memory_md`: Clean, deduplicated, well-structured Markdown handbook (`MEMORY.md`). Preserve high-value prior sections (architecture, user operating rules, durable implementation pitfalls, workflow hygiene). Prune outdated/superseded claims when newer rollouts resolved them. Treat current repo state as authoritative.
+3. `skills`: Preserve valuable existing domain `SKILL.md` playbooks (with valid YAML frontmatter `name` and `description`) and add a new skill ONLY when a distinct, multi-step domain workflow is clearly established.
+
+=== PRIOR MEMORY.md ===
+{prior_memory[:28000]}
+
+=== EXISTING SKILLS ===
+{chr(10).join(existing_skills)[:18000]}
+
+=== RECENT ROLLOUT SUMMARIES ===
+{chr(10).join(recent_rollouts)[:18000]}
+
+=== RECENT RAW MEMORIES ===
+{recent_raw}
+"""
+    res = call_llm_json(prompt, STAGE2_SCHEMA, model=model, timeout=150)
+    if not res:
+        return False
+    mem_md = str(res.get("memory_md", "")).strip()
+    mem_sum = str(res.get("memory_summary", "")).strip()
+    if len(mem_md) < 80 or len(mem_sum) < 40:
+        return False
+
+    ws_dir.mkdir(parents=True, exist_ok=True)
+    mem_md_path.write_text(mem_md + "\n", encoding="utf-8")
+    sum_md_path.write_text(mem_sum + "\n", encoding="utf-8")
+
+    skills = res.get("skills")
+    if isinstance(skills, list) and skills:
+        sdir.mkdir(parents=True, exist_ok=True)
+        for sk in skills:
+            if not isinstance(sk, dict):
+                continue
+            raw_name = str(sk.get("name", "")).strip().lower()
+            safe_name = re.sub(r"[^a-z0-9-]+", "-", raw_name).strip("-")
+            desc = " ".join(str(sk.get("description", "")).split()).strip()
+            content = str(sk.get("content", "")).strip()
+            if safe_name and len(content) > 40:
+                if not content.startswith("---\n"):
+                    desc_val = json.dumps(desc or f"Workspace playbook for {safe_name}.")
+                    content = f"---\nname: {safe_name}\ndescription: {desc_val}\n---\n\n{content}"
+                target = sdir / safe_name
+                target.mkdir(parents=True, exist_ok=True)
+                (target / "SKILL.md").write_text(content + "\n", encoding="utf-8")
+    return True
+
+
+def cmd_sync(args: argparse.Namespace) -> int:
+    state = load_state()
+    if not state.get("enabled", True) and not getattr(args, "force", False):
+        return 0
+
+    MEM_ROOT.mkdir(parents=True, exist_ok=True)
+    lock_fd = open(LOCK_PATH, "w")
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        if not args.quiet:
+            print("Another agent-memory sync is already running.")
+        return 0
+
+    try:
+        conn = open_db()
+        now = dt.datetime.now(dt.timezone.utc).timestamp()
+        min_idle = 0 if args.force else MIN_IDLE_SEC
+        target_slug = cwd_to_slug(args.cwd) if args.cwd else None
+        ws_map = load_history_workspace_map(conn)
+
+        candidates: list[tuple[str, str, str, float, Path]] = []
+
+        # 1. Scan Antigravity transcripts
+        if AGY_BRAIN_DIR.is_dir():
+            for tfile in glob.glob(str(AGY_BRAIN_DIR / "*" / ".system_generated" / "logs" / "transcript.jsonl")):
+                tp = Path(tfile)
+                cid = tp.parents[2].name
+                mtime = tp.stat().st_mtime
+                if now - mtime < min_idle:
+                    continue
+                ws_path = ws_map.get(cid)
+                if not ws_path or not should_auto_track_workspace(ws_path):
+                    continue
+                slug = cwd_to_slug(ws_path)
+                if target_slug and slug != target_slug:
+                    continue
+                row = conn.execute("SELECT mtime FROM processed_threads WHERE thread_id = ?", (f"agy:{cid}",)).fetchone()
+                # Skip historical threads older than 3 days on initial bootstrap unless --force
+                if row is None and not args.force and (now - mtime > 3 * 86400):
+                    conn.execute(
+                        "INSERT OR REPLACE INTO processed_threads VALUES (?, 'agy', ?, ?, 'skipped_old', 1, NULL, ?)",
+                        (f"agy:{cid}", slug, mtime, dt.datetime.now(dt.timezone.utc).isoformat()),
+                    )
+                    continue
+                if row and mtime - float(row[0]) < 60:
+                    continue
+                candidates.append((f"agy:{cid}", "agy", slug, mtime, tp))
+
+        # 2. Scan Pi transcripts (~/.pi/agent/sessions/**/*.jsonl)
+        if PI_SESSIONS_DIR.is_dir():
+            for sfile in PI_SESSIONS_DIR.rglob("*.jsonl"):
+                mtime = sfile.stat().st_mtime
+                if now - mtime < min_idle:
+                    continue
+                tid = f"pi:{sfile.stem}"
+                row = conn.execute("SELECT mtime FROM processed_threads WHERE thread_id = ?", (tid,)).fetchone()
+                if row and mtime - float(row[0]) < 60:
+                    continue
+                cwd, _ = extract_pi_transcript_digest(sfile, max_chars=2000)
+                if not cwd or not should_auto_track_workspace(cwd):
+                    continue
+                slug = cwd_to_slug(cwd)
+                if target_slug and slug != target_slug:
+                    continue
+                candidates.append((tid, "pi", slug, mtime, sfile))
+
+        conn.commit()
+        candidates.sort(key=lambda x: x[3], reverse=True)
+        candidates = candidates[: args.max_sessions]
+
+        dirty_slugs: set[str] = set()
+        model = state.get("model") or DEFAULT_MODEL
+        processed = 0
+
+        for tid, harness, slug, mtime, path in candidates:
+            if harness == "agy":
+                digest = extract_agy_transcript_digest(path)
+            else:
+                _, digest = extract_pi_transcript_digest(path)
+
+            iso_now = dt.datetime.now(dt.timezone.utc).isoformat()
+            if not digest:
+                conn.execute(
+                    "INSERT OR REPLACE INTO processed_threads VALUES (?, ?, ?, ?, 'empty', 1, NULL, ?)",
+                    (tid, harness, slug, mtime, iso_now),
+                )
+                conn.commit()
+                continue
+
+            res = run_stage1(tid, digest, model=model)
+            if res is None:
+                continue
+            processed += 1
+            summary = redact_secrets(str(res.get("rollout_summary", "")).strip())
+            raw_mem = redact_secrets(str(res.get("raw_memory", "")).strip())
+            rslug = re.sub(r"[^a-z0-9_-]+", "_", str(res.get("rollout_slug") or "session").lower()).strip("_")[:40] or "session"
+
+            if not summary and not raw_mem:
+                conn.execute(
+                    "INSERT OR REPLACE INTO processed_threads VALUES (?, ?, ?, ?, 'no_signal', 1, NULL, ?)",
+                    (tid, harness, slug, mtime, iso_now),
+                )
+                conn.commit()
+                continue
+
+            ws_dir = MEM_ROOT / slug
+            rdir = ws_dir / "rollout_summaries"
+            rdir.mkdir(parents=True, exist_ok=True)
+            date_prefix = dt.datetime.fromtimestamp(mtime, tz=dt.timezone.utc).strftime("%Y-%m-%d")
+            short_id = tid.split(":", 1)[-1][:8]
+            rfile = rdir / f"{date_prefix}_{short_id}_{rslug}.md"
+            rfile.write_text(f"# {rslug} ({tid})\n\n{summary}\n", encoding="utf-8")
+
+            if raw_mem:
+                with (ws_dir / "raw_memories.md").open("a", encoding="utf-8") as rf:
+                    rf.write(f"\n\n## {date_prefix} ({tid} — {rslug})\n\n{raw_mem}\n")
+
+            conn.execute(
+                "INSERT OR REPLACE INTO processed_threads VALUES (?, ?, ?, ?, 'extracted', 0, ?, ?)",
+                (tid, harness, slug, mtime, str(rfile), iso_now),
+            )
+            conn.commit()
+            dirty_slugs.add(slug)
+
+        # Also check any slug with unconsolidated stage1 rows
+        rows = conn.execute("SELECT DISTINCT workspace_slug FROM processed_threads WHERE consolidated = 0").fetchall()
+        for (s,) in rows:
+            if not target_slug or s == target_slug:
+                dirty_slugs.add(s)
+
+        consolidated_count = 0
+        for slug in sorted(dirty_slugs):
+            ws_dir = MEM_ROOT / slug
+            if run_stage2(ws_dir, model=model):
+                conn.execute("UPDATE processed_threads SET consolidated = 1 WHERE workspace_slug = ?", (slug,))
+                conn.commit()
+                reindex_fts(conn, slug)
+                consolidated_count += 1
+
+        sync_skills_json()
+        state["last_auto_sync"] = now
+        save_state(state)
+
+        if not args.quiet:
+            print(f"Memory sync complete (model={model}): stage1={processed}, consolidated_workspaces={consolidated_count}")
+        return 0
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        lock_fd.close()
+
+
+def spawn_detached_sync() -> None:
+    state = load_state()
+    now = dt.datetime.now(dt.timezone.utc).timestamp()
+    if now - float(state.get("last_auto_sync", 0.0)) < SYNC_COOLDOWN_SEC:
+        return
+    state["last_auto_sync"] = now
+    save_state(state)
+    try:
+        subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve()), "sync", "--quiet"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except Exception:
+        pass
+
+
+def build_startup_guidance(ws_dir: Path) -> tuple[str, int]:
+    sum_path = ws_dir / "memory_summary.md"
+    mem_path = ws_dir / "MEMORY.md"
+    sdir = ws_dir / "skills"
+
+    summary = ""
+    if sum_path.is_file():
+        summary = sum_path.read_text(encoding="utf-8", errors="replace").strip()
+    elif mem_path.is_file():
+        summary = "\n".join(mem_path.read_text(encoding="utf-8", errors="replace").splitlines()[:25]).strip()
+
+    skill_names: list[str] = []
+    if sdir.is_dir():
+        skill_names = sorted(c.name for c in sdir.iterdir() if c.is_dir() and (c / "SKILL.md").is_file())
+
+    skill_line = (
+        f"Repo memory playbooks (`{sdir}/<name>/SKILL.md`): {', '.join(skill_names)}"
+        if skill_names
+        else f"Repo memory root: `{ws_dir}`"
+    )
+    msg = (
+        f"# Repository Memory ({ws_dir.name})\n"
+        f"Rules:\n"
+        f"1. Below is the compact `memory_summary.md`. Read `{mem_path}` via `read_file` when working on architecture, pitfalls, deployment, or cross-cutting flows.\n"
+        f"2. {skill_line}\n"
+        f"3. For historical rollout lookup across past sessions, run `agent-memory search \"<keywords>\"`.\n"
+        f"4. Memory is advisory context only — current repository files, tests, and explicit user instructions ALWAYS win if memory is stale.\n\n"
+        f"Summary:\n{summary}"
+    )
+    return msg, len(skill_names)
+
+
+def cmd_session_start_hook(_args: argparse.Namespace) -> int:
+    if os.environ.get("AGY_HOOK_INTERNAL") == "1":
+        print("{}")
+        return 0
+    try:
+        payload = json.loads(sys.stdin.read() or "{}")
+    except Exception:
+        payload = {}
+
+    state = load_state()
+    if not state.get("enabled", True):
+        print("{}")
+        return 0
+
+    wpaths = payload.get("workspacePaths") or []
+    cid = payload.get("conversationId") or ""
+    if not wpaths:
+        print("{}")
+        return 0
+
+    wpath = wpaths[0]
+    slug = cwd_to_slug(wpath)
+    try:
+        conn = open_db()
+        if cid:
+            conn.execute(
+                "INSERT OR REPLACE INTO session_workspaces VALUES (?, ?, ?, ?)",
+                (cid, str(resolve_workspace_root(wpath)), slug, dt.datetime.now(dt.timezone.utc).timestamp()),
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+    spawn_detached_sync()
+
+    ws_dir = MEM_ROOT / slug
+    if not (ws_dir / "memory_summary.md").is_file() and not (ws_dir / "MEMORY.md").is_file():
+        print("{}")
+        return 0
+
+    guidance, n_skills = build_startup_guidance(ws_dir)
+    badge = f"Loaded repo memory `{slug}` (`MEMORY.md` + {n_skills} learned skills)."
+    out = {
+        "injectSteps": [
+            {
+                "systemMessage": {
+                    "systemMessage": guidance,
+                    "metadata": {"user_markdown": badge},
+                }
+            }
+        ]
+    }
+    print(json.dumps(out))
+    return 0
+
+
+def cmd_stop_hook(_args: argparse.Namespace) -> int:
+    if os.environ.get("AGY_HOOK_INTERNAL") == "1":
+        print("{}")
+        return 0
+    try:
+        payload = json.loads(sys.stdin.read() or "{}")
+    except Exception:
+        payload = {}
+
+    state = load_state()
+    if state.get("enabled", True):
+        wpaths = payload.get("workspacePaths") or []
+        cid = payload.get("conversationId") or ""
+        if wpaths and cid:
+            try:
+                conn = open_db()
+                conn.execute(
+                    "INSERT OR REPLACE INTO session_workspaces VALUES (?, ?, ?, ?)",
+                    (cid, str(resolve_workspace_root(wpaths[0])), cwd_to_slug(wpaths[0]), dt.datetime.now(dt.timezone.utc).timestamp()),
+                )
+                conn.commit()
+            except Exception:
+                pass
+        spawn_detached_sync()
+
+    print("{}")
+    return 0
+
+
+def cmd_search(args: argparse.Namespace) -> int:
+    conn = open_db()
+    cnt = conn.execute("SELECT COUNT(*) FROM documents_fts").fetchone()[0]
+    if cnt == 0:
+        reindex_fts(conn)
+
+    raw_terms = [ re.sub(r"[^A-Za-z0-9_-]", "", t) for t in args.query.split() ]
+    terms = [ f'"{t}"' for t in raw_terms if t ]
+    if not terms:
+        print("Empty search query.")
+        return 1
+    fts_query = " OR ".join(terms)
+
+    slug = None if args.all else cwd_to_slug(args.cwd or os.getcwd())
+    if slug and (MEM_ROOT / slug).is_dir():
+        rows = conn.execute(
+            """
+            SELECT workspace_slug, doc_type, title, doc_id,
+                   snippet(documents_fts, 4, '[', ']', ' ... ', 28)
+            FROM documents_fts
+            WHERE documents_fts MATCH ? AND workspace_slug = ?
+            ORDER BY bm25(documents_fts)
+            LIMIT ?
+            """,
+            (fts_query, slug, args.limit),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """
+            SELECT workspace_slug, doc_type, title, doc_id,
+                   snippet(documents_fts, 4, '[', ']', ' ... ', 28)
+            FROM documents_fts
+            WHERE documents_fts MATCH ?
+            ORDER BY bm25(documents_fts)
+            LIMIT ?
+            """,
+            (fts_query, args.limit),
+        ).fetchall()
+
+    if not rows:
+        print(f"No memory matches for: {args.query}")
+        return 0
+    for wslug, dtype, title, doc_id, snip in rows:
+        clean_snip = " ".join(str(snip).split())
+        print(f"[{dtype}] {title} ({doc_id})\n  {clean_snip}\n")
+    return 0
+
+
+def cmd_remember(args: argparse.Namespace) -> int:
+    cwd = args.cwd or os.getcwd()
+    slug = cwd_to_slug(cwd)
+    ws_dir = MEM_ROOT / slug
+    ws_dir.mkdir(parents=True, exist_ok=True)
+    note = redact_secrets(" ".join(args.note).strip())
+    if not note:
+        print("Empty note.")
+        return 1
+    stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    with (ws_dir / "raw_memories.md").open("a", encoding="utf-8") as rf:
+        rf.write(f"\n\n## {stamp} (explicit note)\n\n- {note}\n")
+
+    mem_path = ws_dir / "MEMORY.md"
+    existing = mem_path.read_text(encoding="utf-8", errors="replace") if mem_path.is_file() else f"# {slug} Memory\n"
+    if "## Explicit Notes" in existing:
+        existing = existing.rstrip() + f"\n- ({stamp[:10]}) {note}\n"
+    else:
+        existing = existing.rstrip() + f"\n\n## Explicit Notes\n\n- ({stamp[:10]}) {note}\n"
+    mem_path.write_text(existing, encoding="utf-8")
+
+    conn = open_db()
+    reindex_fts(conn, slug)
+    print(f"Saved durable note to {mem_path}")
+    return 0
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    state = load_state()
+    conn = open_db()
+    cwd = args.cwd or os.getcwd()
+    slug = cwd_to_slug(cwd)
+    ws_dir = MEM_ROOT / slug
+    fts_docs = conn.execute("SELECT COUNT(*) FROM documents_fts").fetchone()[0]
+    workspaces = sorted(d.name for d in MEM_ROOT.iterdir() if d.is_dir() and d.name.startswith("--")) if MEM_ROOT.is_dir() else []
+
+    print(f"Shared Agent Memory (~/.agents/memories)")
+    print(f"  Enabled          : {'ON' if state.get('enabled', True) else 'OFF'}")
+    print(f"  Consolidator     : {state.get('model', DEFAULT_MODEL)}")
+    print(f"  Indexed FTS docs : {fts_docs}")
+    print(f"  Tracked repos    : {len(workspaces)} ({', '.join(workspaces)})")
+    print(f"  Current CWD slug : {slug}")
+    if ws_dir.is_dir():
+        mem_lines = len((ws_dir / "MEMORY.md").read_text(encoding="utf-8", errors="ignore").splitlines()) if (ws_dir / "MEMORY.md").is_file() else 0
+        rollouts = len(list((ws_dir / "rollout_summaries").glob("*.md"))) if (ws_dir / "rollout_summaries").is_dir() else 0
+        skills = [c.name for c in (ws_dir / "skills").iterdir() if c.is_dir() and (c / "SKILL.md").is_file()] if (ws_dir / "skills").is_dir() else []
+        print(f"  Repo MEMORY.md   : {mem_lines} lines | {rollouts} rollouts | {len(skills)} skills ({', '.join(skills)})")
+    else:
+        print("  Repo MEMORY.md   : (none yet for current directory)")
+    return 0
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(prog="agent-memory", description="Shared memory manager for Antigravity and Pi")
+    sub = p.add_subparsers(dest="cmd")
+
+    ps = sub.add_parser("status")
+    ps.add_argument("--cwd", default=None)
+
+    sub.add_parser("on")
+    sub.add_parser("off")
+
+    pm = sub.add_parser("model")
+    pm.add_argument("model_id")
+
+    pr = sub.add_parser("reindex")
+    pr.add_argument("--cwd", default=None)
+
+    psearch = sub.add_parser("search")
+    psearch.add_argument("query")
+    psearch.add_argument("--cwd", default=None)
+    psearch.add_argument("--all", action="store_true")
+    psearch.add_argument("--limit", type=int, default=6)
+
+    prem = sub.add_parser("remember")
+    prem.add_argument("note", nargs="+")
+    prem.add_argument("--cwd", default=None)
+
+    psync = sub.add_parser("sync")
+    psync.add_argument("--cwd", default=None)
+    psync.add_argument("--max-sessions", type=int, default=4)
+    psync.add_argument("--force", action="store_true")
+    psync.add_argument("--quiet", action="store_true")
+
+    sub.add_parser("session-start-hook")
+    sub.add_parser("stop-hook")
+
+    args = p.parse_args()
+    cmd = args.cmd or "status"
+
+    if cmd == "status":
+        return cmd_status(args)
+    if cmd == "on":
+        st = load_state()
+        st["enabled"] = True
+        save_state(st)
+        print("Agent memory: ON")
+        return 0
+    if cmd == "off":
+        st = load_state()
+        st["enabled"] = False
+        save_state(st)
+        print("Agent memory: OFF")
+        return 0
+    if cmd == "model":
+        st = load_state()
+        st["model"] = args.model_id
+        save_state(st)
+        print(f"Agent memory consolidator model set to: {args.model_id}")
+        return 0
+    if cmd == "reindex":
+        conn = open_db()
+        slug = cwd_to_slug(args.cwd) if args.cwd else None
+        n = reindex_fts(conn, slug)
+        sync_skills_json()
+        print(f"Indexed {n} memory documents into FTS5.")
+        return 0
+    if cmd == "search":
+        return cmd_search(args)
+    if cmd == "remember":
+        return cmd_remember(args)
+    if cmd == "sync":
+        if not hasattr(args, "cwd"):
+            args.cwd = None
+        return cmd_sync(args)
+    if cmd == "session-start-hook":
+        return cmd_session_start_hook(args)
+    if cmd == "stop-hook":
+        return cmd_stop_hook(args)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

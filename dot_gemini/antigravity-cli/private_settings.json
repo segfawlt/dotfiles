@@ -1,0 +1,24 @@
+{
+  "agentMode": "auto",
+  "model": "Gemini 3.8 Flash (Medium)",
+  "notifications": true,
+  "permissions": {
+    "allow": [
+      "command(ls)"
+    ]
+  },
+  "statusLine": {
+    "type": "command",
+    "command": "/home/domixi/.local/bin/agy-statusline",
+    "enabled": true,
+    "stack_with_default": true
+  },
+  "toolPermission": "always-proceed",
+  "trustedWorkspaces": [
+    "/home/domixi",
+    "/home/domixi/Projects/NewProject",
+    "/home/domixi/Downloads",
+    "/home/domixi/Projects/scorm-assistant"
+  ],
+  "verbosity": "high"
+}

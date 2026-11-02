@@ -1,0 +1,1129 @@
+#!/usr/bin/env python3
+"""
+agy-diagnostics: Instant Post-Edit Syntax & Error Diagnostics for Antigravity (`agy`).
+
+Architecture (Antigravity Hook Contract):
+  1. `PostToolUse` (`edit_file|write_file`, <50ms):
+     Checks the mutated file immediately. Since Antigravity's `PostToolUse` hook only
+     accepts `{}` on stdout, findings are staged in `~/.agents/diagnostics/pending/<cid>.json`
+     (`pending_inject` + `active_unfixed`). Subsequent edits that fix the file clear both sets
+     immediately so stale errors are never emitted.
+  2. `PreInvocation` (<20ms):
+     Pops `pending_inject`, re-verifies each file on disk, and injects a transient
+     `ephemeralMessage` (`<diagnostics>...</diagnostics>`) + compact `user_markdown` badge.
+     Because `ephemeralMessage` is dropped after the turn, fixed typos leave ZERO permanent
+     token bloat in conversation history.
+  3. `Stop` (`NO_TOOL_CALL`, <50ms safety net):
+     Re-verifies any remaining `active_unfixed` files introduced in this session. If a file
+     edited by the agent is still syntactically broken on disk when the agent tries to finish,
+     blocks completion once per user prompt (`{"decision": "continue", "reason": "..."}`).
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import tomllib
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+DIAG_HOME = Path.home() / ".agents" / "diagnostics"
+STATE_FILE = DIAG_HOME / "state.json"
+PENDING_DIR = DIAG_HOME / "pending"
+LOG_FILE = DIAG_HOME / "diagnostics.log"
+
+MAX_FILE_BYTES = 2 * 1024 * 1024  # 2 MB
+MAX_LOG_BYTES = 512 * 1024
+
+IGNORED_DIR_PARTS = {
+    ".git",
+    "node_modules",
+    "dist",
+    "build",
+    ".next",
+    ".nuxt",
+    ".svelte-kit",
+    ".turbo",
+    "coverage",
+    "__pycache__",
+    ".venv",
+    "venv",
+    "target",
+    "vendor",
+}
+
+JSONC_FILENAMES = {
+    "tsconfig.json",
+    "jsconfig.json",
+    "biome.json",
+    "biome.jsonc",
+    "turbo.json",
+    ".eslintrc.json",
+    ".oxlintrc.json",
+    "devcontainer.json",
+}
+
+JSONC_PARENT_DIRS = {".vscode", ".zed", ".devcontainer"}
+
+TS_JS_LOADERS = {
+    ".ts": "ts",
+    ".mts": "ts",
+    ".cts": "ts",
+    ".tsx": "tsx",
+    ".jsx": "jsx",
+    ".js": "js",
+    ".mjs": "js",
+    ".cjs": "js",
+}
+
+ALL_CHECKER_NAMES = (
+    "python",
+    "ts-js",
+    "json",
+    "jsonl",
+    "toml",
+    "yaml",
+    "shell",
+    "fish",
+    "go",
+)
+
+DEFAULT_STATE: dict[str, Any] = {
+    "enabled": True,
+    "checks_run": 0,
+    "issues_caught": 0,
+    "injections_sent": 0,
+    "stop_blocks": 0,
+    "disabled_checkers": [],
+}
+
+BUN_TRANSPILE_SNIPPET = r"""
+import fs from "fs";
+const [file, loader] = process.argv.slice(1);
+const src = fs.readFileSync(file, "utf8");
+try {
+  new Bun.Transpiler({
+    loader,
+    tsconfig: JSON.stringify({ compilerOptions: { experimentalDecorators: true } }),
+  }).transformSync(src);
+} catch (err) {
+  const pos = err && err.position ? err.position : null;
+  const msg = (err && err.message) ? String(err.message) : String(err);
+  if (pos && typeof pos.line === "number") {
+    const col = typeof pos.column === "number" ? pos.column : 1;
+    const lineText = typeof pos.lineText === "string" ? pos.lineText.trimEnd() : "";
+    console.error(`line ${pos.line}, col ${col}: ${msg}` + (lineText ? `\n  ${pos.line} | ${lineText}` : ""));
+  } else {
+    console.error(msg);
+  }
+  process.exit(1);
+}
+"""
+
+BUN_JSONC_SNIPPET = r"""
+import fs from "fs";
+const file = process.argv[1];
+const src = fs.readFileSync(file, "utf8");
+try {
+  Bun.JSONC.parse(src);
+} catch (err) {
+  console.error((err && err.message) ? String(err.message) : String(err));
+  process.exit(1);
+}
+"""
+
+BUN_YAML_SNIPPET = r"""
+import fs from "fs";
+const file = process.argv[1];
+const src = fs.readFileSync(file, "utf8");
+try {
+  Bun.YAML.parse(src);
+} catch (err) {
+  console.error((err && err.message) ? String(err.message) : String(err));
+  process.exit(1);
+}
+"""
+
+
+def ensure_dirs() -> None:
+    DIAG_HOME.mkdir(parents=True, exist_ok=True)
+    PENDING_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def load_state() -> dict[str, Any]:
+    ensure_dirs()
+    state = dict(DEFAULT_STATE)
+    if STATE_FILE.is_file():
+        try:
+            loaded = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                state.update(loaded)
+        except Exception:
+            pass
+    if not isinstance(state.get("disabled_checkers"), list):
+        state["disabled_checkers"] = []
+    return state
+
+
+def save_state(state: dict[str, Any]) -> None:
+    ensure_dirs()
+    tmp = STATE_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tmp.replace(STATE_FILE)
+
+
+def sanitize_cid(cid: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9_.-]+", "_", cid)[:96]
+
+
+def pending_path(cid: str) -> Path:
+    ensure_dirs()
+    return PENDING_DIR / f"{sanitize_cid(cid)}.json"
+
+
+def load_pending(cid: str) -> dict[str, Any]:
+    fp = pending_path(cid)
+    base: dict[str, Any] = {
+        "last_user_input": "",
+        "stop_continuations": 0,
+        "pending_inject": {},
+        "active_unfixed": {},
+    }
+    if fp.is_file():
+        try:
+            loaded = json.loads(fp.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                base.update(loaded)
+        except Exception:
+            pass
+    if not isinstance(base.get("pending_inject"), dict):
+        base["pending_inject"] = {}
+    if not isinstance(base.get("active_unfixed"), dict):
+        base["active_unfixed"] = {}
+    return base
+
+
+def save_pending(cid: str, data: dict[str, Any]) -> None:
+    fp = pending_path(cid)
+    if not data.get("pending_inject") and not data.get("active_unfixed") and not data.get("stop_continuations"):
+        try:
+            fp.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return
+    tmp = fp.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(fp)
+
+
+def log_event(message: str) -> None:
+    try:
+        ensure_dirs()
+        if LOG_FILE.is_file() and LOG_FILE.stat().st_size > MAX_LOG_BYTES:
+            lines = LOG_FILE.read_text(encoding="utf-8", errors="ignore").splitlines()[-400:]
+            LOG_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        ts = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+        with LOG_FILE.open("a", encoding="utf-8") as fh:
+            fh.write(f"{ts} {message}\n")
+    except Exception:
+        pass
+
+
+def should_ignore_path(path: Path) -> bool:
+    if not path.is_file():
+        return True
+    try:
+        st = path.stat()
+        if st.st_size > MAX_FILE_BYTES:
+            return True
+    except OSError:
+        return True
+    for part in path.parts:
+        if part in IGNORED_DIR_PARTS:
+            return True
+    return False
+
+
+def is_jsonc_path(path: Path) -> bool:
+    name = path.name.lower()
+    if name.endswith(".jsonc") or name in JSONC_FILENAMES:
+        return True
+    if (name.startswith("tsconfig.") or name.startswith("jsconfig.")) and name.endswith(".json"):
+        return True
+    if path.parent.name in JSONC_PARENT_DIRS and name.endswith(".json"):
+        return True
+    return False
+
+
+def detect_shebang_kind(first_line: str) -> str | None:
+    if not first_line.startswith("#!"):
+        return None
+    low = first_line.lower()
+    if "python" in low:
+        return "python"
+    if "fish" in low:
+        return "fish"
+    if "zsh" in low:
+        return "zsh"
+    if "bash" in low:
+        return "bash"
+    if re.search(r"\b(sh|dash|ash)\b", low):
+        return "sh"
+    if "bun" in low or "node" in low or "deno" in low:
+        return "js"
+    return None
+
+
+def find_repo_local_bin(start_file: Path, bin_name: str, rel_subpath: tuple[str, ...]) -> str | None:
+    cur = start_file.parent
+    for _ in range(7):
+        cand = cur.joinpath(*rel_subpath, bin_name)
+        if cand.is_file() and os.access(cand, os.X_OK):
+            return str(cand)
+        if (cur / ".git").exists() or cur.parent == cur:
+            break
+        cur = cur.parent
+    return shutil.which(bin_name)
+
+
+def first_line_of(detail: str) -> str:
+    for ln in detail.splitlines():
+        s = ln.strip()
+        if s:
+            return s[:220]
+    return "syntax error"
+
+
+def check_python(path: Path, raw_bytes: bytes) -> dict[str, str] | None:
+    try:
+        compile(raw_bytes, str(path), "exec")
+    except SyntaxError as exc:
+        lineno = exc.lineno or 1
+        col = exc.offset or 1
+        msg = exc.msg or "invalid syntax"
+        src_line = (exc.text or "").rstrip("\r\n")
+        detail = f"line {lineno}, col {col}: {msg}"
+        if src_line:
+            detail += f"\n  {lineno} | {src_line}"
+        return {"checker": "python-ast", "summary": f"line {lineno}, col {col}: {msg}", "detail": detail}
+    except ValueError as exc:
+        # e.g. source code string cannot contain null bytes
+        msg = str(exc)
+        return {"checker": "python-ast", "summary": msg, "detail": msg}
+
+    # Optional fast high-signal Ruff check (only syntax / undefined-name / broken return/yield errors)
+    ruff_bin = find_repo_local_bin(path, "ruff", (".venv", "bin"))
+    if ruff_bin:
+        try:
+            proc = subprocess.run(
+                [ruff_bin, "check", "--select=E9,F63,F7,F82", "--output-format=concise", "--quiet", str(path)],
+                capture_output=True,
+                text=True,
+                timeout=1.5,
+            )
+            if proc.returncode != 0 and proc.stdout.strip():
+                lines = [ln.strip() for ln in proc.stdout.strip().splitlines() if ln.strip()][:5]
+                detail = "\n".join(lines)
+                return {"checker": "ruff", "summary": first_line_of(detail), "detail": detail}
+        except Exception:
+            pass
+    return None
+
+
+def check_ts_js(path: Path, loader: str) -> dict[str, str] | None:
+    bun_bin = shutil.which("bun")
+    if not bun_bin:
+        if loader == "js":
+            node_bin = shutil.which("node")
+            if node_bin:
+                try:
+                    proc = subprocess.run(
+                        [node_bin, "--check", str(path)],
+                        capture_output=True,
+                        text=True,
+                        timeout=2.0,
+                    )
+                    if proc.returncode != 0:
+                        err = (proc.stderr or proc.stdout).strip()
+                        return {"checker": "node-check", "summary": first_line_of(err), "detail": err[:900]}
+                except Exception:
+                    pass
+        return None
+
+    try:
+        proc = subprocess.run(
+            [bun_bin, "-e", BUN_TRANSPILE_SNIPPET, str(path), loader],
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+        )
+        if proc.returncode != 0:
+            err = (proc.stderr or proc.stdout).strip()
+            return {"checker": f"bun-{loader}", "summary": first_line_of(err), "detail": err[:900]}
+    except Exception:
+        return None
+
+    # Optional repo-local oxlint correctness errors (<35ms Rust linter)
+    oxlint_bin = find_repo_local_bin(path, "oxlint", ("node_modules", ".bin"))
+    if oxlint_bin:
+        try:
+            proc = subprocess.run(
+                [oxlint_bin, "-D", "correctness", "-A", "warnings", "--quiet", str(path)],
+                capture_output=True,
+                text=True,
+                timeout=1.8,
+            )
+            if proc.returncode != 0:
+                out = (proc.stdout or proc.stderr).strip()
+                if out:
+                    return {"checker": "oxlint", "summary": first_line_of(out), "detail": out[:900]}
+        except Exception:
+            pass
+    return None
+
+
+def check_json(path: Path, text: str) -> dict[str, str] | None:
+    if is_jsonc_path(path):
+        bun_bin = shutil.which("bun")
+        if bun_bin:
+            try:
+                proc = subprocess.run(
+                    [bun_bin, "-e", BUN_JSONC_SNIPPET, str(path)],
+                    capture_output=True,
+                    text=True,
+                    timeout=2.0,
+                )
+                if proc.returncode != 0:
+                    err = (proc.stderr or proc.stdout).strip()
+                    return {"checker": "bun-jsonc", "summary": first_line_of(err), "detail": err[:700]}
+            except Exception:
+                pass
+        return None
+
+    try:
+        json.loads(text)
+    except json.JSONDecodeError as exc:
+        lines = text.splitlines()
+        src_line = lines[exc.lineno - 1].rstrip() if 1 <= exc.lineno <= len(lines) else ""
+        summary = f"line {exc.lineno}, col {exc.colno}: {exc.msg}"
+        detail = summary + (f"\n  {exc.lineno} | {src_line[:200]}" if src_line else "")
+        return {"checker": "json", "summary": summary, "detail": detail}
+    return None
+
+
+def check_jsonl(text: str) -> dict[str, str] | None:
+    errors: list[str] = []
+    for idx, raw_line in enumerate(text.splitlines(), start=1):
+        stripped = raw_line.strip()
+        if not stripped:
+            continue
+        try:
+            json.loads(stripped)
+        except json.JSONDecodeError as exc:
+            errors.append(f"line {idx}, col {exc.colno}: {exc.msg}\n  {idx} | {stripped[:180]}")
+            if len(errors) >= 3:
+                break
+    if errors:
+        detail = "\n".join(errors)
+        return {"checker": "jsonl", "summary": first_line_of(detail), "detail": detail}
+    return None
+
+
+def check_toml(text: str) -> dict[str, str] | None:
+    try:
+        tomllib.loads(text)
+    except tomllib.TOMLDecodeError as exc:
+        msg = str(exc)
+        return {"checker": "toml", "summary": first_line_of(msg), "detail": msg}
+    return None
+
+
+def check_yaml(path: Path, text: str) -> dict[str, str] | None:
+    try:
+        import yaml  # type: ignore
+
+        try:
+            for _ in yaml.safe_load_all(text):
+                pass
+            return None
+        except yaml.YAMLError as exc:
+            mark = getattr(exc, "problem_mark", None)
+            prob = getattr(exc, "problem", None) or str(exc)
+            if mark is not None:
+                lineno = mark.line + 1
+                col = mark.column + 1
+                lines = text.splitlines()
+                src_line = lines[lineno - 1].rstrip() if 1 <= lineno <= len(lines) else ""
+                summary = f"line {lineno}, col {col}: {prob}"
+                detail = summary + (f"\n  {lineno} | {src_line[:200]}" if src_line else "")
+                return {"checker": "pyyaml", "summary": summary, "detail": detail}
+            return {"checker": "pyyaml", "summary": first_line_of(str(exc)), "detail": str(exc)[:700]}
+    except ImportError:
+        pass
+
+    bun_bin = shutil.which("bun")
+    if bun_bin:
+        try:
+            proc = subprocess.run(
+                [bun_bin, "-e", BUN_YAML_SNIPPET, str(path)],
+                capture_output=True,
+                text=True,
+                timeout=2.0,
+            )
+            if proc.returncode != 0:
+                err = (proc.stderr or proc.stdout).strip()
+                return {"checker": "bun-yaml", "summary": first_line_of(err), "detail": err[:700]}
+        except Exception:
+            pass
+    return None
+
+
+def check_shell(path: Path, shell_flavor: str) -> dict[str, str] | None:
+    shell_bin = shutil.which(shell_flavor) or shutil.which("bash") or shutil.which("sh")
+    if not shell_bin:
+        return None
+    try:
+        proc = subprocess.run(
+            [shell_bin, "-n", str(path)],
+            capture_output=True,
+            text=True,
+            timeout=1.5,
+        )
+        if proc.returncode != 0:
+            err = (proc.stderr or proc.stdout).strip()
+            prefix = f"{path}:"
+            cleaned = "\n".join(
+                ln[len(prefix) :].strip() if ln.startswith(prefix) else ln for ln in err.splitlines()
+            )
+            return {
+                "checker": f"{Path(shell_bin).name}-n",
+                "summary": first_line_of(cleaned),
+                "detail": cleaned[:700],
+            }
+    except Exception:
+        return None
+
+    sc_bin = shutil.which("shellcheck")
+    if sc_bin and shell_flavor in ("bash", "sh"):
+        try:
+            proc = subprocess.run(
+                [sc_bin, "-S", "error", "-f", "gcc", str(path)],
+                capture_output=True,
+                text=True,
+                timeout=1.8,
+            )
+            if proc.returncode != 0 and proc.stdout.strip():
+                lines = [ln.strip() for ln in proc.stdout.strip().splitlines() if ln.strip()][:5]
+                detail = "\n".join(lines)
+                return {"checker": "shellcheck", "summary": first_line_of(detail), "detail": detail}
+        except Exception:
+            pass
+    return None
+
+
+def check_fish(path: Path) -> dict[str, str] | None:
+    fish_bin = shutil.which("fish")
+    if not fish_bin:
+        return None
+    try:
+        proc = subprocess.run(
+            [fish_bin, "--no-execute", str(path)],
+            capture_output=True,
+            text=True,
+            timeout=1.5,
+        )
+        if proc.returncode != 0:
+            err = (proc.stderr or proc.stdout).strip()
+            return {"checker": "fish", "summary": first_line_of(err), "detail": err[:700]}
+    except Exception:
+        pass
+    return None
+
+
+def check_go(path: Path) -> dict[str, str] | None:
+    gofmt_bin = shutil.which("gofmt")
+    if not gofmt_bin:
+        return None
+    try:
+        proc = subprocess.run(
+            [gofmt_bin, "-e", str(path)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=1.5,
+        )
+        if proc.returncode != 0 and proc.stderr.strip():
+            err = proc.stderr.strip()
+            return {"checker": "gofmt", "summary": first_line_of(err), "detail": err[:700]}
+    except Exception:
+        pass
+    return None
+
+
+def check_file(path: Path, disabled_checkers: set[str] | None = None) -> tuple[bool, dict[str, str] | None]:
+    """
+    Inspect `path` if supported.
+    Returns `(checked, issue_dict_or_None)`.
+    """
+    disabled = disabled_checkers or set()
+    if should_ignore_path(path):
+        return False, None
+
+    try:
+        raw_bytes = path.read_bytes()
+    except OSError:
+        return False, None
+
+    # Skip binary files containing NUL bytes (except .py where compile() reports a clear error)
+    suffix = path.suffix.lower()
+    if suffix not in (".py", ".pyi") and b"\x00" in raw_bytes[:4096]:
+        return False, None
+
+    text = raw_bytes.decode("utf-8", errors="replace")
+    first_line = text.splitlines()[0] if text else ""
+
+    if suffix in (".py", ".pyi"):
+        if "python" in disabled:
+            return False, None
+        return True, check_python(path, raw_bytes)
+
+    if suffix in TS_JS_LOADERS:
+        if "ts-js" in disabled:
+            return False, None
+        return True, check_ts_js(path, TS_JS_LOADERS[suffix])
+
+    if suffix in (".json", ".jsonc"):
+        if "json" in disabled:
+            return False, None
+        return True, check_json(path, text)
+
+    if suffix in (".jsonl", ".ndjson"):
+        if "jsonl" in disabled:
+            return False, None
+        return True, check_jsonl(text)
+
+    if suffix == ".toml":
+        if "toml" in disabled:
+            return False, None
+        return True, check_toml(text)
+
+    if suffix in (".yaml", ".yml"):
+        if "yaml" in disabled:
+            return False, None
+        return True, check_yaml(path, text)
+
+    if suffix in (".sh", ".bash", ".zsh"):
+        if "shell" in disabled:
+            return False, None
+        flavor = suffix.lstrip(".")
+        return True, check_shell(path, flavor)
+
+    if suffix == ".fish":
+        if "fish" in disabled:
+            return False, None
+        return True, check_fish(path)
+
+    if suffix == ".go":
+        if "go" in disabled:
+            return False, None
+        return True, check_go(path)
+
+    # Extensionless scripts with explicit shebangs (e.g. ~/.local/bin/*)
+    if not suffix and first_line.startswith("#!"):
+        kind = detect_shebang_kind(first_line)
+        if kind == "python" and "python" not in disabled:
+            return True, check_python(path, raw_bytes)
+        if kind in ("bash", "sh", "zsh") and "shell" not in disabled:
+            return True, check_shell(path, kind)
+        if kind == "fish" and "fish" not in disabled:
+            return True, check_fish(path)
+        if kind == "js" and "ts-js" not in disabled:
+            return True, check_ts_js(path, "js")
+
+    return False, None
+
+
+def format_diagnostics_block(issues_by_path: dict[str, dict[str, Any]]) -> str:
+    blocks: list[str] = []
+    for fpath, info in issues_by_path.items():
+        checker = info.get("checker", "syntax")
+        detail = str(info.get("detail") or info.get("summary") or "syntax error").strip()
+        blocks.append(f'<diagnostic file="{fpath}" checker="{checker}">\n{detail}\n</diagnostic>')
+    body = "\n".join(blocks)
+    return (
+        "<diagnostics guidance=\"Fix syntax/parse errors introduced in these edited files before finishing.\">\n"
+        f"{body}\n"
+        "</diagnostics>"
+    )
+
+
+def format_badge_markdown(issues_by_path: dict[str, dict[str, Any]]) -> str:
+    items = list(issues_by_path.items())
+    first_path, first_info = items[0]
+    bname = Path(first_path).name
+    summary = str(first_info.get("summary") or "syntax error")
+    if len(items) == 1:
+        return f"**Diagnostics (`{first_info.get('checker', 'syntax')}`):** `{bname}` — {summary}"
+    return f"**Diagnostics:** syntax errors in `{bname}` (+{len(items) - 1} more)"
+
+
+def cmd_post_tool_hook(_args: argparse.Namespace) -> int:
+    if os.environ.get("AGY_HOOK_INTERNAL") == "1":
+        print("{}")
+        return 0
+    try:
+        payload = json.loads(sys.stdin.read() or "{}")
+    except Exception:
+        print("{}")
+        return 0
+
+    cid = str(payload.get("conversationId") or "").strip()
+    if not cid or payload.get("error"):
+        print("{}")
+        return 0
+
+    state = load_state()
+    if not state.get("enabled", True):
+        print("{}")
+        return 0
+
+    tcall = payload.get("toolCall") or {}
+    tname = str(tcall.get("name") or "")
+    if tname not in ("edit_file", "write_file"):
+        print("{}")
+        return 0
+
+    targs = tcall.get("args") or {}
+    raw_path = str(targs.get("Path") or targs.get("AbsolutePath") or "").strip()
+    if not raw_path:
+        print("{}")
+        return 0
+
+    target = Path(raw_path).expanduser()
+    try:
+        abs_str = str(target.resolve())
+    except Exception:
+        abs_str = str(target)
+
+    t0 = time.monotonic()
+    disabled = set(state.get("disabled_checkers") or [])
+    checked, issue = check_file(Path(abs_str), disabled)
+    elapsed_ms = int((time.monotonic() - t0) * 1000)
+
+    pend = load_pending(cid)
+    if checked:
+        state["checks_run"] = int(state.get("checks_run", 0)) + 1
+
+    if issue:
+        entry = {
+            "checker": issue["checker"],
+            "summary": issue["summary"],
+            "detail": issue["detail"],
+            "elapsed_ms": elapsed_ms,
+            "ts": round(time.time(), 2),
+        }
+        pend["pending_inject"][abs_str] = entry
+        pend["active_unfixed"][abs_str] = entry
+        state["issues_caught"] = int(state.get("issues_caught", 0)) + 1
+        save_pending(cid, pend)
+        save_state(state)
+        log_event(
+            f"[CAUGHT] cid={cid[:8]} checker={issue['checker']} ({elapsed_ms}ms) file={abs_str} -> {issue['summary']}"
+        )
+    else:
+        was_broken = abs_str in pend["pending_inject"] or abs_str in pend["active_unfixed"]
+        pend["pending_inject"].pop(abs_str, None)
+        pend["active_unfixed"].pop(abs_str, None)
+        save_pending(cid, pend)
+        if checked:
+            save_state(state)
+        if was_broken:
+            log_event(f"[CLEARED] cid={cid[:8]} ({elapsed_ms}ms) file={abs_str}")
+
+    print("{}")
+    return 0
+
+
+def revalidate_map(
+    file_map: dict[str, Any], disabled: set[str]
+) -> dict[str, dict[str, Any]]:
+    still_broken: dict[str, dict[str, Any]] = {}
+    for fpath in list(file_map.keys()):
+        p = Path(fpath)
+        if not p.is_file():
+            continue
+        checked, issue = check_file(p, disabled)
+        if checked and issue:
+            still_broken[fpath] = {
+                "checker": issue["checker"],
+                "summary": issue["summary"],
+                "detail": issue["detail"],
+            }
+    return still_broken
+
+
+def cmd_pre_invocation_hook(_args: argparse.Namespace) -> int:
+    if os.environ.get("AGY_HOOK_INTERNAL") == "1":
+        print("{}")
+        return 0
+    try:
+        payload = json.loads(sys.stdin.read() or "{}")
+    except Exception:
+        print("{}")
+        return 0
+
+    cid = str(payload.get("conversationId") or "").strip()
+    if not cid:
+        print("{}")
+        return 0
+
+    fp = pending_path(cid)
+    if not fp.is_file():
+        print("{}")
+        return 0
+
+    state = load_state()
+    if not state.get("enabled", True):
+        print("{}")
+        return 0
+
+    pend = load_pending(cid)
+    user_in = str(payload.get("lastUserInput") or "").strip()
+    if user_in and user_in != pend.get("last_user_input"):
+        pend["last_user_input"] = user_in
+        pend["stop_continuations"] = 0
+
+    to_inject = pend.get("pending_inject") or {}
+    if not to_inject:
+        save_pending(cid, pend)
+        print("{}")
+        return 0
+
+    disabled = set(state.get("disabled_checkers") or [])
+    verified = revalidate_map(to_inject, disabled)
+
+    # Clear pending_inject so we only emit once per edit; sync active_unfixed with reality on disk
+    pend["pending_inject"] = {}
+    for old_path in list(to_inject.keys()):
+        if old_path in verified:
+            pend["active_unfixed"][old_path] = verified[old_path]
+        else:
+            pend["active_unfixed"].pop(old_path, None)
+    save_pending(cid, pend)
+
+    if not verified:
+        print("{}")
+        return 0
+
+    state["injections_sent"] = int(state.get("injections_sent", 0)) + 1
+    save_state(state)
+
+    ephemeral = format_diagnostics_block(verified)
+    badge = format_badge_markdown(verified)
+    log_event(f"[INJECT] cid={cid[:8]} count={len(verified)} -> {badge}")
+
+    out = {
+        "injectSteps": [
+            {"ephemeralMessage": ephemeral},
+            {
+                "systemMessage": {
+                    "systemMessage": "",
+                    "metadata": {"user_markdown": badge},
+                }
+            },
+        ]
+    }
+    print(json.dumps(out))
+    return 0
+
+
+def cmd_stop_hook(_args: argparse.Namespace) -> int:
+    if os.environ.get("AGY_HOOK_INTERNAL") == "1":
+        print(json.dumps({"decision": "stop"}))
+        return 0
+    try:
+        payload = json.loads(sys.stdin.read() or "{}")
+    except Exception:
+        print(json.dumps({"decision": "stop"}))
+        return 0
+
+    if payload.get("terminationReason") != "NO_TOOL_CALL" or payload.get("fullyIdle") is False:
+        print(json.dumps({"decision": "stop"}))
+        return 0
+
+    cid = str(payload.get("conversationId") or "").strip()
+    if not cid or not pending_path(cid).is_file():
+        print(json.dumps({"decision": "stop"}))
+        return 0
+
+    state = load_state()
+    if not state.get("enabled", True):
+        print(json.dumps({"decision": "stop"}))
+        return 0
+
+    pend = load_pending(cid)
+    user_in = str(payload.get("lastUserInput") or "").strip()
+    if user_in and user_in != pend.get("last_user_input"):
+        pend["last_user_input"] = user_in
+        pend["stop_continuations"] = 0
+
+    active = pend.get("active_unfixed") or {}
+    if not active:
+        save_pending(cid, pend)
+        print(json.dumps({"decision": "stop"}))
+        return 0
+
+    disabled = set(state.get("disabled_checkers") or [])
+    still_broken = revalidate_map(active, disabled)
+    pend["active_unfixed"] = still_broken
+    pend["pending_inject"] = {}
+
+    if not still_broken or int(pend.get("stop_continuations", 0)) >= 1:
+        save_pending(cid, pend)
+        print(json.dumps({"decision": "stop"}))
+        return 0
+
+    pend["stop_continuations"] = int(pend.get("stop_continuations", 0)) + 1
+    save_pending(cid, pend)
+
+    state["stop_blocks"] = int(state.get("stop_blocks", 0)) + 1
+    save_state(state)
+
+    reason = format_diagnostics_block(still_broken)
+    log_event(f"[STOP-BLOCK] cid={cid[:8]} unfixed={len(still_broken)}")
+    print(json.dumps({"decision": "continue", "reason": reason}))
+    return 0
+
+
+def detect_host_engines() -> dict[str, str]:
+    engines: dict[str, str] = {
+        "python": f"python-ast ({sys.version.split()[0]})" + (" + ruff" if shutil.which("ruff") else ""),
+        "ts-js": (
+            f"bun-transpiler ({shutil.which('bun')})"
+            if shutil.which("bun")
+            else (f"node --check ({shutil.which('node')})" if shutil.which("node") else "unavailable")
+        ),
+        "json": "python-json + " + ("bun-jsonc" if shutil.which("bun") else "strict-json"),
+        "jsonl": "python-jsonl",
+        "toml": "python-tomllib",
+        "yaml": "pyyaml" if _has_pyyaml() else ("bun-yaml" if shutil.which("bun") else "unavailable"),
+        "shell": (shutil.which("bash") or shutil.which("sh") or "unavailable")
+        + (" + shellcheck" if shutil.which("shellcheck") else ""),
+        "fish": shutil.which("fish") or "unavailable",
+        "go": shutil.which("gofmt") or "unavailable (optional)",
+    }
+    return engines
+
+
+def _has_pyyaml() -> bool:
+    try:
+        import yaml  # noqa: F401 # type: ignore
+
+        return True
+    except ImportError:
+        return False
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    state = load_state()
+    engines = detect_host_engines()
+    pending_sessions = len(list(PENDING_DIR.glob("*.json"))) if PENDING_DIR.is_dir() else 0
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    **state,
+                    "pending_sessions": pending_sessions,
+                    "engines": engines,
+                },
+                indent=2,
+            )
+        )
+        return 0
+
+    disabled = set(state.get("disabled_checkers") or [])
+    status_str = "ENABLED" if state.get("enabled", True) else "DISABLED"
+    print(f"Instant Post-Edit Diagnostics: {status_str}")
+    print(
+        f"  Stats: checks_run={state.get('checks_run', 0)}  "
+        f"issues_caught={state.get('issues_caught', 0)}  "
+        f"injections_sent={state.get('injections_sent', 0)}  "
+        f"stop_blocks={state.get('stop_blocks', 0)}  "
+        f"active_sessions={pending_sessions}"
+    )
+    print("  Checkers:")
+    for name in ALL_CHECKER_NAMES:
+        flag = "OFF" if name in disabled else "ON "
+        print(f"    [{flag}] {name:<8} -> {engines.get(name, 'unknown')}")
+    return 0
+
+
+def cmd_toggle(enable: bool) -> int:
+    state = load_state()
+    state["enabled"] = enable
+    save_state(state)
+    print(f"Diagnostics {'enabled' if enable else 'disabled'}.")
+    return 0
+
+
+def cmd_checker(args: argparse.Namespace) -> int:
+    name = args.name.lower().strip()
+    if name not in ALL_CHECKER_NAMES:
+        print(f"Unknown checker '{name}'. Valid checkers: {', '.join(ALL_CHECKER_NAMES)}", file=sys.stderr)
+        return 2
+    mode = args.mode.lower().strip()
+    state = load_state()
+    disabled = set(state.get("disabled_checkers") or [])
+    if mode == "on":
+        disabled.discard(name)
+    elif mode == "off":
+        disabled.add(name)
+    else:
+        print("Mode must be 'on' or 'off'.", file=sys.stderr)
+        return 2
+    state["disabled_checkers"] = sorted(disabled)
+    save_state(state)
+    print(f"Checker '{name}' set to {mode.upper()}.")
+    return 0
+
+
+def cmd_check(args: argparse.Namespace) -> int:
+    state = load_state()
+    disabled = set(state.get("disabled_checkers") or [])
+    targets: list[Path] = []
+    for raw in args.paths:
+        p = Path(raw).expanduser()
+        if p.is_dir():
+            for sub in sorted(p.rglob("*")):
+                if sub.is_file() and not should_ignore_path(sub):
+                    targets.append(sub)
+        else:
+            targets.append(p)
+
+    checked_cnt = 0
+    errors_cnt = 0
+    t0 = time.monotonic()
+    for p in targets:
+        checked, issue = check_file(p, disabled)
+        if not checked:
+            continue
+        checked_cnt += 1
+        if issue:
+            errors_cnt += 1
+            print(f"[FAIL] {p} ({issue['checker']}):\n  {issue['detail']}\n")
+        elif args.verbose:
+            print(f"[OK]   {p}")
+    elapsed_ms = int((time.monotonic() - t0) * 1000)
+    print(f"Checked {checked_cnt} file(s) in {elapsed_ms}ms — {errors_cnt} error(s).")
+    return 1 if errors_cnt > 0 else 0
+
+
+def cmd_logs(args: argparse.Namespace) -> int:
+    ensure_dirs()
+    if not LOG_FILE.is_file():
+        print("(No diagnostics logs yet.)")
+        return 0
+    lines = LOG_FILE.read_text(encoding="utf-8", errors="replace").splitlines()
+    for ln in lines[-args.lines :]:
+        print(ln)
+    if args.follow:
+        try:
+            with LOG_FILE.open("r", encoding="utf-8", errors="replace") as fh:
+                fh.seek(0, os.SEEK_END)
+                while True:
+                    line = fh.readline()
+                    if line:
+                        print(line, end="", flush=True)
+                    else:
+                        time.sleep(0.4)
+        except KeyboardInterrupt:
+            return 0
+    return 0
+
+
+def cmd_reset(_args: argparse.Namespace) -> int:
+    ensure_dirs()
+    state = load_state()
+    state["checks_run"] = 0
+    state["issues_caught"] = 0
+    state["injections_sent"] = 0
+    state["stop_blocks"] = 0
+    save_state(state)
+    if PENDING_DIR.is_dir():
+        for fp in PENDING_DIR.glob("*.json"):
+            fp.unlink(missing_ok=True)
+    if LOG_FILE.is_file():
+        LOG_FILE.unlink(missing_ok=True)
+    print("Diagnostics counters, pending state, and logs reset.")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="agy-diagnostics", description="Instant post-edit syntax & error diagnostics")
+    sub = p.add_subparsers(dest="cmd")
+
+    p_st = sub.add_parser("status", help="Show diagnostics status, stats, and detected host engines")
+    p_st.add_argument("--json", action="store_true", help="Emit raw JSON status")
+
+    sub.add_parser("on", help="Enable instant post-edit diagnostics")
+    sub.add_parser("off", help="Disable instant post-edit diagnostics")
+
+    p_chk = sub.add_parser("checker", help="Enable or disable a specific language checker")
+    p_chk.add_argument("name", help=f"Checker name ({', '.join(ALL_CHECKER_NAMES)})")
+    p_chk.add_argument("mode", choices=["on", "off"], help="Turn checker on or off")
+
+    p_run = sub.add_parser("check", help="Manually run fast diagnostics on file(s) or directory")
+    p_run.add_argument("paths", nargs="+", help="Files or directories to check")
+    p_run.add_argument("-v", "--verbose", action="store_true", help="Print passing files too")
+
+    p_log = sub.add_parser("logs", help="View recent caught/injected diagnostics events")
+    p_log.add_argument("-n", "--lines", type=int, default=30, help="Number of tail lines")
+    p_log.add_argument("-f", "--follow", action="store_true", help="Follow live log updates")
+
+    sub.add_parser("reset", help="Reset counters, pending session state, and log file")
+
+    sub.add_parser("post-tool-hook", help=argparse.SUPPRESS)
+    sub.add_parser("pre-invocation-hook", help=argparse.SUPPRESS)
+    sub.add_parser("stop-hook", help=argparse.SUPPRESS)
+    return p
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    cmd = args.cmd or "status"
+    if cmd == "status":
+        if not hasattr(args, "json"):
+            args.json = False
+        return cmd_status(args)
+    if cmd == "on":
+        return cmd_toggle(True)
+    if cmd == "off":
+        return cmd_toggle(False)
+    if cmd == "checker":
+        return cmd_checker(args)
+    if cmd == "check":
+        return cmd_check(args)
+    if cmd == "logs":
+        return cmd_logs(args)
+    if cmd == "reset":
+        return cmd_reset(args)
+    if cmd == "post-tool-hook":
+        return cmd_post_tool_hook(args)
+    if cmd == "pre-invocation-hook":
+        return cmd_pre_invocation_hook(args)
+    if cmd == "stop-hook":
+        return cmd_stop_hook(args)
+    parser.print_help()
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

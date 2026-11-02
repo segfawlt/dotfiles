@@ -1,0 +1,321 @@
+#!/usr/bin/env python3
+"""
+agy-statusline: Fast (<15ms) local harness HUD for Antigravity CLI (agy).
+Stacks cleanly with agy's built-in status line (stack_with_default: true)
+to surface Git/Worktrees, Persistent Advisor state, Instant Diagnostics,
+and toggleable MCP plugin state (Playwright).
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+RESET = "\033[0m"
+DIM = "\033[2m"
+GREEN = "\033[32m"
+YELLOW = "\033[33m"
+RED = "\033[31m"
+CYAN = "\033[36m"
+
+HOME = Path.home()
+AGENTS_DIR = HOME / ".agents"
+GEMINI_CONFIG_DIR = HOME / ".gemini" / "config"
+
+LOG_LINE_RE = re.compile(
+    r"^\[(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\] \[(?P<tag>[^\]]+)\] watched=(?P<wcid>[0-9a-f]+)\b(?P<rest>.*)$"
+)
+DUR_RE = re.compile(r"\b(\d+(?:\.\d+)?)s\b")
+ISSUES_RE = re.compile(r"\bissues=(\d+)\b")
+
+
+def read_json(path: Path) -> dict:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def short_model(name: str) -> str:
+    n = (name or "").lower()
+    if "argon" in n:
+        return "argon"
+    if "flash-lite" in n or "lite" in n:
+        return "flash-lite"
+    if "flash" in n:
+        return "flash"
+    if "pro" in n:
+        return "pro"
+    if "sonnet" in n:
+        return "sonnet"
+    if "opus" in n:
+        return "opus"
+    return n.split("-")[-1][:10] if n else "auto"
+
+
+def is_plugin_enabled(plugin_name: str, default: bool = True) -> bool:
+    cfg = read_json(GEMINI_CONFIG_DIR / "config.json")
+    plugins = cfg.get("plugins")
+    if isinstance(plugins, dict) and plugin_name in plugins:
+        entry = plugins[plugin_name]
+        if isinstance(entry, dict) and "enabled" in entry:
+            return bool(entry["enabled"])
+    pjson = read_json(GEMINI_CONFIG_DIR / "plugins" / plugin_name / "plugin.json")
+    if "disabled" in pjson:
+        return not bool(pjson["disabled"])
+    return default
+
+
+def find_git_root(start: Path) -> tuple[Path, Path, Path] | None:
+    """Return (worktree_root, git_dir, common_git_dir) using pure filesystem lookups."""
+    try:
+        cur = start.resolve()
+    except Exception:
+        return None
+    if cur.is_file():
+        cur = cur.parent
+
+    for d in (cur, *cur.parents):
+        dot_git = d / ".git"
+        if dot_git.is_dir():
+            return d, dot_git, dot_git
+        if dot_git.is_file():
+            try:
+                raw = dot_git.read_text(encoding="utf-8").strip()
+                if raw.startswith("gitdir:"):
+                    git_dir = (d / raw.split(":", 1)[1].strip()).resolve()
+                    commondir_file = git_dir / "commondir"
+                    if commondir_file.is_file():
+                        common_rel = commondir_file.read_text(encoding="utf-8").strip()
+                        common_dir = (git_dir / common_rel).resolve()
+                    else:
+                        common_dir = git_dir
+                    return d, git_dir, common_dir
+            except Exception:
+                return None
+    return None
+
+
+def build_git_segment(cwd: str, touched_paths: list[str]) -> str | None:
+    info = find_git_root(Path(cwd)) if cwd else None
+    if info is None:
+        for tp in reversed(touched_paths[-8:]):
+            info = find_git_root(Path(tp))
+            if info is not None:
+                break
+    if info is None:
+        return None
+
+    wt_root, git_dir, common_dir = info
+    branch = "HEAD"
+    try:
+        head = (git_dir / "HEAD").read_text(encoding="utf-8").strip()
+        if head.startswith("ref: refs/heads/"):
+            branch = head[len("ref: refs/heads/") :]
+        elif len(head) >= 7:
+            branch = head[:7]
+    except Exception:
+        pass
+
+    extra_wts = 0
+    wt_admin = common_dir / "worktrees"
+    if wt_admin.is_dir():
+        try:
+            extra_wts = sum(1 for x in wt_admin.iterdir() if x.is_dir())
+        except Exception:
+            extra_wts = 0
+
+    dirty = ""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(wt_root), "status", "--porcelain", "-uno", "--no-optional-locks"],
+            capture_output=True,
+            text=True,
+            timeout=0.06,
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            dirty = f"{YELLOW}*{RESET}"
+    except Exception:
+        pass
+
+    wt_badge = f" {DIM}(+{extra_wts} wt){RESET}" if extra_wts > 0 else ""
+    return f"{CYAN}git:{RESET} {branch}{dirty}{wt_badge}"
+
+
+def tail_advisor_log(cid_short: str) -> dict | None:
+    """Scan last 8KB of advisor.log for latest event matching this session (or live review)."""
+    log_path = AGENTS_DIR / "advisor" / "advisor.log"
+    if not log_path.is_file():
+        return None
+    try:
+        size = log_path.stat().st_size
+        with log_path.open("rb") as f:
+            if size > 8192:
+                f.seek(size - 8192)
+            raw = f.read().decode("utf-8", errors="replace")
+    except Exception:
+        return None
+
+    lines = raw.splitlines()
+    latest_for_cid: dict | None = None
+    active_starts: dict[str, dict] = {}
+    now = time.time()
+
+    for line in lines:
+        m = LOG_LINE_RE.match(line)
+        if not m:
+            continue
+        tag = m.group("tag")
+        wcid = m.group("wcid")
+        rest = m.group("rest")
+        ts_epoch = 0.0
+        try:
+            ts_epoch = time.mktime(time.strptime(m.group("ts"), "%Y-%m-%d %H:%M:%S"))
+        except Exception:
+            pass
+
+        entry = {"tag": tag, "wcid": wcid, "rest": rest, "ts": ts_epoch}
+        if tag.startswith("START "):
+            active_starts[wcid] = entry
+        else:
+            active_starts.pop(wcid, None)
+
+        if cid_short and wcid == cid_short:
+            latest_for_cid = entry
+
+    # If ANY review (Lead or child subagent) started within the last 95s and hasn't finished yet:
+    for wcid, st in active_starts.items():
+        if st["ts"] and (now - st["ts"]) <= 95:
+            if not cid_short or wcid == cid_short or "(subagent:" in st["rest"]:
+                return {"live": True, **st}
+
+    return latest_for_cid
+
+
+def build_advisor_segment(cid: str, sess: dict) -> tuple[str, list[str]]:
+    touched = sess.get("touched_paths") if isinstance(sess.get("touched_paths"), list) else []
+    if not is_plugin_enabled("advisor", True):
+        return f"{DIM}adv: off{RESET}", touched
+
+    state = read_json(AGENTS_DIR / "advisor" / "state.json")
+    if not state.get("enabled", True):
+        return f"{DIM}adv: off{RESET}", touched
+
+    mod = short_model(str(sess.get("advisor_model") or state.get("model") or ""))
+    fails = int(sess.get("consecutive_advisor_failures") or 0)
+    if fails >= 3:
+        return f"{RED}adv: latched ({fails}/3 err){RESET}", touched
+
+    cid_short = cid[:8] if cid else ""
+    log_hit = tail_advisor_log(cid_short)
+
+    if log_hit and log_hit.get("live"):
+        sub = "sub" if "(subagent:" in log_hit.get("rest", "") else mod
+        return f"{YELLOW}adv: reviewing… ({sub}){RESET}", touched
+
+    mutated = bool(sess.get("mutated_since_stop"))
+    if log_hit and not log_hit.get("live"):
+        tag = log_hit["tag"]
+        rest = log_hit["rest"]
+        dur_m = DUR_RE.search(rest)
+        dur = f" {dur_m.group(1)}s" if dur_m else ""
+
+        if tag.startswith("REVISE"):
+            iss_m = ISSUES_RE.search(rest)
+            n_iss = iss_m.group(1) if iss_m else "!"
+            if mutated:
+                return f"{CYAN}adv: staged{RESET} {DIM}(last ⚠×{n_iss}){RESET}", touched
+            return f"{YELLOW}adv: ⚠ revise×{n_iss}{dur}{RESET}", touched
+
+        if tag.startswith("PIVOT"):
+            return f"{YELLOW}adv: ↻ pivot{dur}{RESET}", touched
+
+        if tag.startswith("PASS"):
+            if mutated:
+                return f"{CYAN}adv: staged{RESET} {DIM}(last ✓{dur}){RESET}", touched
+            return f"{GREEN}adv: ✓ pass{RESET}{DIM}{dur}{RESET}", touched
+
+        if tag.startswith("SKIP/ERROR"):
+            return f"{YELLOW}adv: err ({fails}/3){RESET}", touched
+
+    if mutated:
+        n_files = len(touched)
+        files_hint = f" · {n_files}f" if n_files else ""
+        return f"{CYAN}adv: staged{RESET}{DIM} ({mod}{files_hint}){RESET}", touched
+
+    revs = int(state.get("reviews_run") or 0)
+    caught = int(state.get("issues_caught") or 0)
+    stats_str = f"{revs} rev" + (f", {caught}!" if caught else "")
+    return f"{GREEN}adv:{RESET} {mod} {DIM}({stats_str}){RESET}", touched
+
+
+def build_diagnostics_segment(cid: str) -> str:
+    if not is_plugin_enabled("diagnostics", True):
+        return f"{DIM}diag: off{RESET}"
+    state = read_json(AGENTS_DIR / "diagnostics" / "state.json")
+    if not state.get("enabled", True):
+        return f"{DIM}diag: off{RESET}"
+
+    if cid:
+        pend = read_json(AGENTS_DIR / "diagnostics" / "pending" / f"{cid}.json")
+        unfixed = pend.get("active_unfixed")
+        if isinstance(unfixed, list) and len(unfixed) > 0:
+            return f"{RED}diag: ✗ {len(unfixed)} err{RESET}"
+        if isinstance(unfixed, dict) and len(unfixed) > 0:
+            return f"{RED}diag: ✗ {len(unfixed)} err{RESET}"
+
+    return f"{GREEN}diag: ✓{RESET}"
+
+
+def build_playwright_segment() -> str:
+    if is_plugin_enabled("playwright", False):
+        return f"{CYAN}pw: ON{RESET}"
+    return f"{DIM}pw: off{RESET}"
+
+
+def main() -> int:
+    payload: dict = {}
+    if not sys.stdin.isatty():
+        try:
+            raw = sys.stdin.read()
+            if raw.strip():
+                payload = json.loads(raw)
+        except Exception:
+            payload = {}
+
+    cid = str(
+        payload.get("session_id")
+        or payload.get("conversation_id")
+        or payload.get("conversationId")
+        or ""
+    )
+    ws = payload.get("workspace") if isinstance(payload.get("workspace"), dict) else {}
+    cwd = str(
+        payload.get("cwd")
+        or ws.get("current_dir")
+        or ws.get("project_dir")
+        or os.getcwd()
+    )
+
+    sess: dict = {}
+    if cid:
+        sess = read_json(AGENTS_DIR / "advisor" / "sessions" / f"{cid}.json")
+
+    adv_seg, touched = build_advisor_segment(cid, sess)
+    git_seg = build_git_segment(cwd, touched)
+    diag_seg = build_diagnostics_segment(cid)
+    pw_seg = build_playwright_segment()
+
+    parts = [p for p in (git_seg, adv_seg, diag_seg, pw_seg) if p]
+    sep = f" {DIM}│{RESET} "
+    sys.stdout.write(sep.join(parts) + "\n")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,13 @@
+{
+  "lockfileVersion": 1,
+  "plugins": {
+    "calculator": {
+      "repo": "https://github.com/rochacbruno/DankCalculator",
+      "commit": "a27b80ad8c3dd42da11af83461674fb362817515"
+    },
+    "mediaControlsPlus": {
+      "repo": "https://github.com/lpv11/dms-media-controls-plus",
+      "commit": "1e8e885d4da4f315a594641af914cea82a66d9fc"
+    }
+  }
+}

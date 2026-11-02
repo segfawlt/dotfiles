@@ -1,0 +1,27 @@
+{
+  "calculator": {
+    "enabled": true,
+    "trigger": "="
+  },
+  "mediaControlsPlus": {
+    "enabled": true
+  },
+  "barVolume": {
+    "enabled": true,
+    "volumeStep": 2,
+    "touchpadStep": 1,
+    "customMaxVolume": 100,
+    "holdRepeatMode": "both",
+    "holdInitialDelayMs": 350,
+    "holdRepeatIntervalMs": 75,
+    "coverageMode": "entireBar",
+    "muteOnVolumeChange": "unmuteOnUp",
+    "useDefaultOsdDuration": false,
+    "customOsdDurationMs": 850,
+    "showOsd": true,
+    "passThroughMediaWidget": false,
+    "passThroughControlCenterSubIcons": true,
+    "controlCenterBrightnessZone": "entireWidget",
+    "perBarCoverageEnabled": false
+  }
+}

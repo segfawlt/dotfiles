@@ -21,6 +21,8 @@ binds {
     XF86AudioPlay allow-when-locked=true { spawn "dms" "ipc" "call" "mpris" "playPause"; }
     XF86AudioPrev allow-when-locked=true { spawn "dms" "ipc" "call" "mpris" "previous"; }
     XF86AudioRaiseVolume allow-when-locked=true { spawn "dms" "ipc" "call" "audio" "increment" "3"; }
+    Mod+Ctrl+Equal allow-when-locked=true { spawn "dms" "ipc" "call" "audio" "increment" "2"; }
+    Mod+Ctrl+Minus allow-when-locked=true { spawn "dms" "ipc" "call" "audio" "decrement" "2"; }
     XF86MonBrightnessDown allow-when-locked=true { spawn "dms" "ipc" "call" "brightness" "decrement" "5" ""; }
     XF86MonBrightnessUp allow-when-locked=true { spawn "dms" "ipc" "call" "brightness" "increment" "5" ""; }
     Mod+1 { focus-workspace 1; }
@@ -125,6 +127,7 @@ binds {
     Super+Shift+S hotkey-overlay-title="Screenshot (Interactive)" { screenshot; }
     XF86Launch1 { screenshot; }
     Mod+Shift+E { quit; }
+    Mod+E { spawn "thunar"; }
     Super+A { spawn "zen-browser"; }
     Mod+D repeat=false { toggle-overview; }
     Mod+Escape allow-inhibiting=false { toggle-keyboard-shortcuts-inhibit; }

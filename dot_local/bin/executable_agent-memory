@@ -515,11 +515,14 @@ def run_stage2(ws_dir: Path, model: str) -> bool:
             if child.is_dir() and sk.is_file():
                 existing_skills.append(f"### Skill: {child.name}\n" + sk.read_text(encoding="utf-8", errors="replace")[:3000])
 
+    repo_dir = resolve_workspace_root(ws_dir.name)
+    head_sha = get_git_head_sha(repo_dir) or "HEAD"
+
     prompt = f"""You are a Stage-2 repository memory consolidator.
 Consolidate the prior MEMORY.md with new Stage-1 raw memories and rollout summaries.
 Rules:
 1. `memory_summary`: A single dense paragraph (180-320 words max) summarizing canonical repo architecture, operating rules, shipped capabilities, and top active pitfalls. Injected at SessionStart.
-2. `memory_md`: Clean, deduplicated, well-structured Markdown handbook (`MEMORY.md`). Preserve high-value prior sections (architecture, user operating rules, durable implementation pitfalls, workflow hygiene). Prune outdated/superseded claims when newer rollouts resolved them. Treat current repo state as authoritative.
+2. `memory_md`: Clean, deduplicated, well-structured Markdown handbook (`MEMORY.md`). Preserve high-value prior sections (architecture, user operating rules, durable implementation pitfalls, workflow hygiene). Prune outdated/superseded claims when newer rollouts resolved them. Treat current repo state as authoritative. Whenever recording or updating a technical fact about code structure, files, or invariants, stamp it with `(verified: {head_sha})`.
 3. `skills`: Preserve valuable existing domain `SKILL.md` playbooks (with valid YAML frontmatter `name` and `description`) and add a new skill ONLY when a distinct, multi-step domain workflow is clearly established.
 
 === PRIOR MEMORY.md ===
@@ -757,13 +760,26 @@ def build_startup_guidance(ws_dir: Path) -> tuple[str, int]:
         if skill_names
         else f"Repo memory root: `{ws_dir}`"
     )
+
+    drift_line = ""
+    try:
+        repo_dir = resolve_workspace_root(ws_dir.name)
+        if repo_dir.is_dir():
+            drift_items = check_memory_drift(ws_dir, repo_dir)
+            drifted_cnt = sum(1 for d in drift_items if d.get("status") in ("drifted", "missing_sha"))
+            if drifted_cnt > 0:
+                drift_line = f"5. ⚠️ Memory drift: {drifted_cnt} note(s) reference code modified since last verified (run 'agent-memory drift').\n"
+    except Exception:
+        pass
+
     msg = (
         f"# Repository Memory ({ws_dir.name})\n"
         f"Rules:\n"
         f"1. Below is the compact `memory_summary.md`. Read `{mem_path}` via `read_file` when working on architecture, pitfalls, deployment, or cross-cutting flows.\n"
         f"2. {skill_line}\n"
         f"3. For historical rollout lookup across past sessions, run `agent-memory search \"<keywords>\"`.\n"
-        f"4. Memory is advisory context only — current repository files, tests, and explicit user instructions ALWAYS win if memory is stale.\n\n"
+        f"4. Memory is advisory context only — current repository files, tests, and explicit user instructions ALWAYS win if memory is stale.\n"
+        f"{drift_line}\n"
         f"Summary:\n{summary}"
     )
     return msg, len(skill_names)
@@ -902,30 +918,197 @@ def cmd_search(args: argparse.Namespace) -> int:
     return 0
 
 
+VERIFIED_SHA_RE = re.compile(r"\(.*?verified:\s*([0-9a-fA-F]{7,40}).*?\)")
+FILE_PATH_RE = re.compile(r"[`'\"]?([a-zA-Z0-9_./-]+\.[a-zA-Z0-9]{1,6})[`'\"]?")
+
+
+def get_git_head_sha(repo_dir: Path) -> str | None:
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo_dir), "rev-parse", "--short", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=1.0,
+        )
+        if proc.returncode == 0:
+            return proc.stdout.strip()
+    except Exception:
+        pass
+    return None
+
+
+def check_memory_drift(ws_dir: Path, repo_dir: Path) -> list[dict[str, Any]]:
+    mem_path = ws_dir / "MEMORY.md"
+    if not mem_path.is_file():
+        return []
+
+    head_sha = get_git_head_sha(repo_dir)
+    if not head_sha:
+        return []
+
+    results: list[dict[str, Any]] = []
+    lines = mem_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    for line in lines:
+        stripped = line.strip()
+        m_sha = VERIFIED_SHA_RE.search(stripped)
+        if not m_sha:
+            continue
+        v_sha = m_sha.group(1)
+        proc_v = subprocess.run(
+            ["git", "-C", str(repo_dir), "rev-parse", "--verify", "-q", f"{v_sha}^{{commit}}"],
+            capture_output=True,
+            text=True,
+            timeout=1.0,
+        )
+        if proc_v.returncode != 0:
+            results.append({
+                "status": "missing_sha",
+                "sha": v_sha,
+                "line": stripped,
+                "msg": f"Commit '{v_sha}' no longer in git history (rebased or pruned).",
+            })
+            continue
+
+        raw_files = FILE_PATH_RE.findall(stripped)
+        existing_files = [
+            f for f in raw_files
+            if (repo_dir / f).is_file() or (not f.startswith("http") and "/" in f)
+        ]
+
+        if existing_files:
+            diff_proc = subprocess.run(
+                ["git", "-C", str(repo_dir), "diff", "--name-only", f"{v_sha}..HEAD", "--", *existing_files],
+                capture_output=True,
+                text=True,
+                timeout=1.5,
+            )
+            modified = [l.strip() for l in diff_proc.stdout.splitlines() if l.strip()]
+            if modified:
+                results.append({
+                    "status": "drifted",
+                    "sha": v_sha,
+                    "line": stripped,
+                    "files": modified,
+                    "msg": f"File(s) modified since verified: {', '.join(modified)}",
+                })
+            else:
+                results.append({
+                    "status": "verified",
+                    "sha": v_sha,
+                    "line": stripped,
+                    "files": existing_files,
+                    "msg": "Verified (referenced file(s) unchanged).",
+                })
+        else:
+            cnt_proc = subprocess.run(
+                ["git", "-C", str(repo_dir), "rev-list", "--count", f"{v_sha}..HEAD"],
+                capture_output=True,
+                text=True,
+                timeout=1.0,
+            )
+            cnt = (
+                int(cnt_proc.stdout.strip())
+                if cnt_proc.returncode == 0 and cnt_proc.stdout.strip().isdigit()
+                else 0
+            )
+            if cnt > 30:
+                results.append({
+                    "status": "stale",
+                    "sha": v_sha,
+                    "line": stripped,
+                    "commits_behind": cnt,
+                    "msg": f"Stale verification ({cnt} commits behind HEAD without file anchors).",
+                })
+            else:
+                results.append({
+                    "status": "verified",
+                    "sha": v_sha,
+                    "line": stripped,
+                    "commits_behind": cnt,
+                    "msg": f"Verified ({cnt} commits behind HEAD).",
+                })
+
+    return results
+
+
+def cmd_drift(args: argparse.Namespace) -> int:
+    cwd = args.cwd or os.getcwd()
+    repo_dir = resolve_workspace_root(cwd)
+    slug = cwd_to_slug(repo_dir)
+    ws_dir = MEM_ROOT / slug
+    if not (ws_dir / "MEMORY.md").is_file():
+        print(f"No MEMORY.md found for workspace '{slug}'.")
+        return 0
+
+    head_sha = get_git_head_sha(repo_dir)
+    print(f"Memory Verification & Drift Audit ({slug})")
+    print(f"  Repo Root : {repo_dir}")
+    print(f"  Head SHA  : {head_sha or 'Not a git repo'}")
+    print()
+
+    results = check_memory_drift(ws_dir, repo_dir)
+    if not results:
+        print("No SHA-verified memory entries found in MEMORY.md yet.")
+        print("Durable facts recorded via '/memory remember' or Stage-2 consolidation will be stamped automatically.")
+        return 0
+
+    drifted = [r for r in results if r["status"] in ("drifted", "missing_sha")]
+    stale = [r for r in results if r["status"] == "stale"]
+    verified = [r for r in results if r["status"] == "verified"]
+
+    if drifted:
+        print(f"⚠️  DRIFTED OR INVALIDATED ({len(drifted)}):")
+        for d in drifted:
+            print(f"  • [{d['status'].upper()}] {d['line']}")
+            print(f"    Reason: {d['msg']}")
+        print()
+
+    if stale:
+        print(f"⏳ STALE ENTRIES ({len(stale)}):")
+        for s in stale:
+            print(f"  • {s['line']}")
+            print(f"    Reason: {s['msg']}")
+        print()
+
+    if verified:
+        print(f"✓ VERIFIED & STABLE ({len(verified)}):")
+        for v in verified:
+            print(f"  • {v['line']}")
+            print(f"    Status: {v['msg']}")
+        print()
+
+    return 1 if drifted else 0
+
+
 def cmd_remember(args: argparse.Namespace) -> int:
     cwd = args.cwd or os.getcwd()
-    slug = cwd_to_slug(cwd)
+    repo_dir = resolve_workspace_root(cwd)
+    slug = cwd_to_slug(repo_dir)
     ws_dir = MEM_ROOT / slug
     ws_dir.mkdir(parents=True, exist_ok=True)
     note = redact_secrets(" ".join(args.note).strip())
     if not note:
         print("Empty note.")
         return 1
+
+    sha = get_git_head_sha(repo_dir)
     stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    sha_tag = f", verified: {sha}" if sha else ""
     with (ws_dir / "raw_memories.md").open("a", encoding="utf-8") as rf:
-        rf.write(f"\n\n## {stamp} (explicit note)\n\n- {note}\n")
+        rf.write(f"\n\n## {stamp} (explicit note{sha_tag})\n\n- {note}\n")
 
     mem_path = ws_dir / "MEMORY.md"
     existing = mem_path.read_text(encoding="utf-8", errors="replace") if mem_path.is_file() else f"# {slug} Memory\n"
+    bullet = f"- ({stamp[:10]}{sha_tag}) {note}\n"
     if "## Explicit Notes" in existing:
-        existing = existing.rstrip() + f"\n- ({stamp[:10]}) {note}\n"
+        existing = existing.rstrip() + f"\n{bullet}"
     else:
-        existing = existing.rstrip() + f"\n\n## Explicit Notes\n\n- ({stamp[:10]}) {note}\n"
+        existing = existing.rstrip() + f"\n\n## Explicit Notes\n\n{bullet}"
     mem_path.write_text(existing, encoding="utf-8")
 
     conn = open_db()
     reindex_fts(conn, slug)
-    print(f"Saved durable note to {mem_path}")
+    print(f"Saved durable note to {mem_path}" + (f" (verified: {sha})" if sha else ""))
     return 0
 
 
@@ -976,6 +1159,9 @@ def main() -> int:
     psearch.add_argument("--all", action="store_true")
     psearch.add_argument("--limit", type=int, default=6)
 
+    pdrift = sub.add_parser("drift")
+    pdrift.add_argument("--cwd", default=None)
+
     prem = sub.add_parser("remember")
     prem.add_argument("note", nargs="+")
     prem.add_argument("--cwd", default=None)
@@ -994,6 +1180,8 @@ def main() -> int:
 
     if cmd == "status":
         return cmd_status(args)
+    if cmd == "drift":
+        return cmd_drift(args)
     if cmd == "on":
         st = load_state()
         st["enabled"] = True

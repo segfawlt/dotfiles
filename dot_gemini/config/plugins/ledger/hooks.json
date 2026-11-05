@@ -1,0 +1,29 @@
+{
+  "ledger": {
+    "enabled": true,
+    "PreToolUse": [
+      {
+        "matcher": "edit_file|write_file",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.local/bin/agy-ledger pre-tool-hook",
+            "timeout": 3
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "edit_file|write_file",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.local/bin/agy-ledger post-tool-hook",
+            "timeout": 3
+          }
+        ]
+      }
+    ]
+  }
+}

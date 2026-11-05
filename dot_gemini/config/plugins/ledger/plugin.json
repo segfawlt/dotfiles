@@ -1,0 +1,6 @@
+{
+  "name": "ledger",
+  "displayName": "Worktree & Multi-Session Edit Ledger",
+  "version": "1.0.0",
+  "description": "Multi-session edit collision watchdog: pauses once when concurrent sessions touch the same file in one checkout, and issues early heads-up alerts across parallel git worktrees before merging."
+}

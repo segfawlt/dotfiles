@@ -1,0 +1,252 @@
+#!/usr/bin/env python3
+"""
+agy-ledger: Multi-Session Concurrent Edit Detector & Worktree Conflict Watchdog.
+- Prevents concurrent sessions in the same directory from clobbering each other's edits.
+- Alerts when sessions in parallel worktrees touch the same file before `git wt-sync`.
+- Uses a shared lock-protected JSON store (~/.agents/ledger/edits.json) with 30-min TTL.
+- Enforces the 'pause once' rule: denies once to prompt a re-read, then allows the retry.
+"""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+WINDOW_SEC = 30 * 60  # 30 minutes
+LEDGER_DIR = Path.home() / ".agents" / "ledger"
+STATE_FILE = LEDGER_DIR / "edits.json"
+LOCK_FILE = LEDGER_DIR / "ledger.lock"
+
+
+def get_git_info(file_path: Path) -> tuple[str | None, str | None, str]:
+    parent = file_path.parent if file_path.parent.is_dir() else Path.cwd()
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(parent), "rev-parse", "--git-common-dir", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            timeout=1.0,
+        )
+        if proc.returncode == 0:
+            lines = [l.strip() for l in proc.stdout.splitlines() if l.strip()]
+            if len(lines) >= 2:
+                top_level = str(Path(lines[1]).resolve())
+                raw_common = lines[0]
+                if os.path.isabs(raw_common):
+                    common_dir = str(Path(raw_common).resolve())
+                else:
+                    common_dir = str(Path(parent / raw_common).resolve())
+                try:
+                    rel_path = str(file_path.resolve().relative_to(Path(top_level)))
+                except ValueError:
+                    rel_path = file_path.name
+                return common_dir, top_level, rel_path
+    except Exception:
+        pass
+    return None, None, str(file_path.resolve())
+
+
+def load_store() -> tuple[dict[str, Any], Any]:
+    LEDGER_DIR.mkdir(parents=True, exist_ok=True)
+    lock_fd = open(LOCK_FILE, "a+", encoding="utf-8")
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+    except Exception:
+        pass
+
+    data: dict[str, Any] = {"edits": {}, "paused": {}}
+    if STATE_FILE.is_file():
+        try:
+            content = STATE_FILE.read_text(encoding="utf-8")
+            if content.strip():
+                data = json.loads(content)
+        except Exception:
+            pass
+    return data, lock_fd
+
+
+def save_store(data: dict[str, Any], lock_fd: Any) -> None:
+    try:
+        tmp = STATE_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        tmp.replace(STATE_FILE)
+    finally:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        except Exception:
+            pass
+        lock_fd.close()
+
+
+def prune_stale(edits: dict[str, Any], now: float) -> dict[str, Any]:
+    return {k: v for k, v in edits.items() if now - v.get("at", 0) < WINDOW_SEC}
+
+
+def format_ago(elapsed_sec: float) -> str:
+    mins = max(1, round(elapsed_sec / 60))
+    return f"{mins}m ago"
+
+
+def cmd_pre_tool() -> int:
+    if os.environ.get("AGY_HOOK_INTERNAL") == "1":
+        print(json.dumps({"decision": "allow"}))
+        return 0
+
+    try:
+        payload = json.loads(sys.stdin.read() or "{}")
+    except Exception:
+        print(json.dumps({"decision": "allow"}))
+        return 0
+
+    tc = payload.get("toolCall") or {}
+    tool_name = str(tc.get("name") or "")
+    if tool_name not in ("edit_file", "write_file"):
+        print(json.dumps({"decision": "allow"}))
+        return 0
+
+    args = tc.get("args") or {}
+    raw_path_str = str(args.get("Path") or args.get("path") or args.get("TargetFile") or "")
+    if not raw_path_str:
+        print(json.dumps({"decision": "allow"}))
+        return 0
+
+    cid = str(payload.get("conversationId") or "").strip()
+    file_path = Path(raw_path_str).expanduser()
+    common_dir, top_level, rel_path = get_git_info(file_path)
+
+    # Key by repo + relative path if in a git repo, else by realpath
+    key = f"{common_dir}:{rel_path}" if common_dir else str(file_path.resolve())
+
+    now = time.time()
+    store, lock_fd = load_store()
+    try:
+        edits = prune_stale(store.get("edits") or {}, now)
+        paused = store.get("paused") or {}
+        store["edits"] = edits
+        store["paused"] = paused
+
+        cid_paused = set(paused.get(cid) or [])
+
+        hit = edits.get(key)
+        if hit and hit.get("session") != cid:
+            elapsed = now - hit.get("at", 0)
+            if elapsed < WINDOW_SEC:
+                other_wt = hit.get("worktree")
+                is_same_worktree = (other_wt == top_level) or (not other_wt and not top_level)
+
+                if is_same_worktree:
+                    # Same directory/checkout collision: pause ONCE so the session re-reads
+                    if key not in cid_paused:
+                        cid_paused.add(key)
+                        paused[cid] = list(cid_paused)
+                        save_store(store, lock_fd)
+                        ago = format_ago(elapsed)
+                        reason = (
+                            f"ledger: '{rel_path}' was edited by another active session ({ago}). "
+                            f"Re-read the file before modifying so you don't clobber changes. "
+                            f"The retry will go through immediately. When committing, stage only your own hunks."
+                        )
+                        print(json.dumps({"decision": "deny", "reason": reason}))
+                        return 0
+                else:
+                    # Cross-worktree edit: allow, but attach early heads-up notice
+                    other_wt_name = Path(other_wt).name if other_wt else "another worktree"
+                    ago = format_ago(elapsed)
+                    reason = (
+                        f"ledger notice: '{rel_path}' is also being edited in parallel worktree '{other_wt_name}' ({ago}). "
+                        f"Keep changes localized so git wt-sync merges cleanly."
+                    )
+                    save_store(store, lock_fd)
+                    print(json.dumps({"decision": "allow", "reason": reason}))
+                    return 0
+
+        save_store(store, lock_fd)
+        print(json.dumps({"decision": "allow"}))
+        return 0
+    except Exception:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        except Exception:
+            pass
+        lock_fd.close()
+        print(json.dumps({"decision": "allow"}))
+        return 0
+
+
+def cmd_post_tool() -> int:
+    if os.environ.get("AGY_HOOK_INTERNAL") == "1":
+        print("{}")
+        return 0
+
+    try:
+        payload = json.loads(sys.stdin.read() or "{}")
+    except Exception:
+        print("{}")
+        return 0
+
+    tc = payload.get("toolCall") or {}
+    tool_name = str(tc.get("name") or "")
+    if tool_name not in ("edit_file", "write_file"):
+        print("{}")
+        return 0
+
+    args = tc.get("args") or {}
+    raw_path_str = str(args.get("Path") or args.get("path") or args.get("TargetFile") or "")
+    if not raw_path_str:
+        print("{}")
+        return 0
+
+    cid = str(payload.get("conversationId") or "").strip()
+    file_path = Path(raw_path_str).expanduser()
+    common_dir, top_level, rel_path = get_git_info(file_path)
+    key = f"{common_dir}:{rel_path}" if common_dir else str(file_path.resolve())
+
+    now = time.time()
+    store, lock_fd = load_store()
+    try:
+        edits = prune_stale(store.get("edits") or {}, now)
+        edits[key] = {
+            "session": cid,
+            "at": now,
+            "worktree": top_level,
+            "common_dir": common_dir,
+            "rel_path": rel_path,
+        }
+        store["edits"] = edits
+        save_store(store, lock_fd)
+    except Exception:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        except Exception:
+            pass
+        lock_fd.close()
+
+    print("{}")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="agy-ledger hook entrypoint")
+    subparsers = parser.add_subparsers(dest="subcommand")
+    subparsers.add_parser("pre-tool-hook")
+    subparsers.add_parser("post-tool-hook")
+    args = parser.parse_args()
+
+    if args.subcommand == "pre-tool-hook":
+        return cmd_pre_tool()
+    if args.subcommand == "post-tool-hook":
+        return cmd_post_tool()
+
+    parser.print_help()
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

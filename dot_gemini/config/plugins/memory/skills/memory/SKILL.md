@@ -20,6 +20,10 @@ Run the matching command via `run_command` based on the user's request (`$ARGUME
   ~/.local/bin/agent-memory search "<query>"
   ```
   *(Add `--all` to search across every repository instead of only the active workspace.)*
+- **Audit memory staleness & git drift** (`/memory drift`):
+  ```bash
+  ~/.local/bin/agent-memory drift
+  ```
 - **Save an explicit durable note / pitfall immediately** (`/memory remember <note>`):
   ```bash
   ~/.local/bin/agent-memory remember "<concise durable technical note>"

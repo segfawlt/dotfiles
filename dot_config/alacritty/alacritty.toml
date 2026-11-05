@@ -1,0 +1,14 @@
+[general]
+import = [
+    "~/.config/alacritty/dank-theme.toml"
+]
+
+[window]
+
+padding.x = 10
+padding.y = 10
+
+[font]
+
+normal.family = "JetBrainsMono Nerd Font"
+size = 14.0
